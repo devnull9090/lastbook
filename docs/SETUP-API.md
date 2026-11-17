@@ -157,7 +157,11 @@ Added 2026-11-17 (mirrors and sharing, docs/DOWNLOAD-SHARING.md):
   rqbit. With it on, each downloaded file with a pinned torrent is kept in `<library>.share` with its `.torrent` instead of being
   deleted after unpacking, and is seeded with rqbit while Lastbook is open. `POST /api/setup/share-delete` deletes the kept files
   (`{…state.sharing, ok, freed_bytes}`).
-- `state.sharing` = `{mirrors, available, on, seeding, kept: [{name, size}], kept_bytes}`.
+- `state.sharing` = `{mirrors, available, on, seeding, kept: [{name, size}], kept_bytes, shared_bytes}`. `shared_bytes`: all the
+  bytes rqbit has uploaded to other people, added up across runs in `<settings>/setup/shared.json`.
+- With sharing on, a file with a pinned torrent that comes in pieces also comes from other people while it downloads (an rqbit
+  writing into the same file, in `downloads/swarm/`). The file is judged by a full read once that rqbit has ended. The job item
+  carries `from_peers`: the bytes taken from other people, each piece checked against its torrent hash.
 
 ## Switching to the library
 

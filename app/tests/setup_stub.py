@@ -134,7 +134,14 @@ SCENARIOS['parallel-paused'] = dict(hardware=hw('windows', ram=32, free=2000), r
 SCENARIOS['sharing'] = dict(mode='manage', hardware=hw('windows', ram=32, free=2000), current={'folder': WIN, 'pack': 'medium', 'model': None, 'map': 'base'},
                             recommend={'pack': 'medium', 'ai': False, 'why': ''},
                             sharing={'on': True, 'seeding': 2, 'kept': [{'name': 'Lastbook-Medium.zip', 'size': 66400000000}], 'kept_bytes': 66400000000,
-                                     'mirrors': ['https://mirror.example/lastbook']})
+                                     'shared_bytes': 214_700_000_000, 'mirrors': ['https://mirror.example/lastbook']})
+# BitTorrent on while the All library downloads: part of it from other people
+SCENARIOS['swarm'] = dict(hardware=hw('windows', ram=32, free=2000), recommend={'pack': 'all', 'ai': False, 'why': ''},
+                          sharing={'on': True},
+                          snapshot={'id': 'j1', 'state': 'downloading', 'error': None, 'folder': WIN, 'items': [
+                              _item('all', 'pack', 'All', 'downloading', 141_300_000_000, 387_878_571_619, rate_bps=31_400_000, eta_s=7_850,
+                                    from_peers=118_600_000_000),
+                              _item('AZ', 'map', 'Arizona', 'downloaded', 1_536_419_242, 1_536_419_242, from_peers=1_100_000_000)]})
 SCENARIOS['kept'] = dict(hardware=hw('windows', ram=32, free=2000), recommend={'pack': 'all', 'ai': False, 'why': ''},
                          snapshot={'id': 'j1', 'state': 'failed', 'folder': WIN, 'items': [
                              _item('all', 'pack', 'All', 'failed', 387_878_571_619, 387_878_571_619,
