@@ -16,7 +16,7 @@ sys.dont_write_bytecode = True
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[1]
 sys.path[:0] = [str(HERE.parent), str(ROOT)]
-from engine.setup import api, download, hardware, install, manifest  # noqa: E402
+from engine.setup import api, download, hardware, install, manifest, torrent  # noqa: E402
 from app.tests import shorttemp  # noqa: E402
 
 ALLOWED = {'127.0.0.1'}     # an address, not 'localhost': Windows tries ::1 first, which the test server does not listen on
@@ -754,6 +754,77 @@ class Pieces(Base):
         with mock.patch.object(download, 'RAMP', 0):
             hosts.acquire('h', 1, c)
         self.assertEqual(hosts.limit('h'), 3)
+
+
+class Torrents(unittest.TestCase):
+    """BitTorrent v2 hashes and hybrid torrents (engine/setup/torrent.py), against libtorrent 2.1.1's for the same file, name and
+    piece length: every case's info-hashes were made with lt.create_torrent and must come out the same, so any client takes ours."""
+    VECTORS = [   # size, piece length, pieces root, infohash v1, infohash v2 (from libtorrent)
+        (100, 16384, 'e8fd2c4f3a453f80113979c7496e61e5be565fcfae4e4e79ac26e5c3f9b53d0c', '5c3b89eb77c75cf03f92994d7e7cc1bf3d9952b2', '8873e96e7f3c67c963eee990cc2a63dfec5eaf65a2bc4a3a8e0979c486e72be3'),
+        (16384, 16384, 'aa333676d16533eddae6d9a9b8a49de6e11910fb3d1ce47b12671f81ebc0b299', '74a3ddca315c3762d61d51a5786c79a3694264a3', '65c4dd6f712b604dc67b102cf0f724f9914d18f0170a5ee0aabb36151cb26e9b'),
+        (40967, 65536, 'b184b0ef4d9061f61ff1885642af14c64e0ae24da1d382e17a4cc9dee9201ea1', '71e787bcad33fda73e08945705dd5007acb99583', 'bc78405e7ea9fc730ca5467c6d1c62a68f1588211786d0a3c9b4edf2deb63821'),
+        (65536, 65536, '8bbbcb6912147974fe08fd81ec95b79e607cbbea7cda01ac641bf8e687a1cf00', '46b9c2f755d0376296aa6651ef1df01a37359c0e', 'f3de6d0d34d362997b1aa684dade570fd8b91cd64281bcf3f0be4330de47ad06'),
+        (65537, 65536, '76102481810bcabb43ed4f8b0f31f61483112d56d7db4d85238ae31a1b75a737', '1437a14be7fa913b8c7f806d5241c456ba497504', '3ed1553d3cb74a1ec1f06308cb1fdc2db614c811fbe733c59bf895aed1c86017'),
+        (196603, 65536, '5c50d7781036106475ccb5f4da920cfdc6d5d4a8a016e07165281edc431ef3c0', 'c85e41567efddfd800216c025d7d1b82253c0b7c', 'c1fb4bf19ecdad339443ec9ee95b8681abba5bf87a10efd42600658e56e1350b'),
+        (327680, 65536, '419111efc583f85fe28ad3f47640c0f1f96a496b613d51a03a959dcaeeea14bb', '72d2432d89734e95867ff34eb609ffee0455c037', '4dbeb3823ff4a5a74914f8b85ba186d65d8bcf10b9af7b8dc0caaef227660ed5'),
+        (2371641, 262144, '49b89f9e2dc2e64274306af9abfda14b75fae608b6bff1fda9cf7556b4ec6b3c', '6920dcb18fb97a8c2c1dee0953b21b7002e95f85', 'b245550a64d846e3d54b2aaec540dde0d68dcd491e5ace9d30395af4f9500932'),
+        (3145729, 1048576, 'b33ee5e8b219aa097f8b3e37a692be4bf14fe5f5fe016c069f3ade9d89c79f16', 'bf3ac4a10c8d3ec71999514f916028ef96b00373', '90963b00847dfcfe4155e829f22381c2e66f285dfac7b1edc07746a70c9d2fb7'),
+    ]
+    NAME = 'Lastbook-Test.zip'
+
+    def setUp(self):
+        self.tmp = shorttemp.mkdtemp('lastbook-torrent-')
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+
+    def file(self, size):
+        p = self.tmp / f'{size}' / self.NAME
+        p.parent.mkdir(exist_ok=True)
+        p.write_bytes(bytes((i * 7 + (i >> 9) * 13) % 251 for i in range(size)))
+        return p
+
+    def test_same_as_libtorrent(self):
+        for size, length, root, v1, v2 in self.VECTORS:
+            with self.subTest(size=size, piece_length=length):
+                data, pin = torrent.make(self.file(size), self.NAME, length)
+                self.assertEqual((pin['pieces_root'], pin['infohash_v1'], pin['infohash_v2']), (root, v1, v2))
+                pieces = torrent.piece_hashes(data, self.NAME, size, root, length)
+                self.assertEqual(pieces.count, max(1, -(-size // length)))
+
+    def test_piece_hasher_takes_any_chunks(self):
+        size, length = 2371641, 262144
+        p = self.file(size)
+        root, hashes = torrent.file_hashes(p, length)
+        data = p.read_bytes()
+        pieces = torrent.Pieces(size, length, hashes)
+        for k in range(pieces.count):
+            a, b = pieces.span(k)
+            h = pieces.hasher(k)
+            for i in range(a, b, 999):
+                h.update(data[i:min(i + 999, b)])
+            self.assertEqual(h.digest(), hashes[k])
+
+    def test_a_torrent_that_is_not_the_pinned_one_is_refused(self):
+        size, length, root, _, _ = self.VECTORS[7]
+        data, _ = torrent.make(self.file(size), self.NAME, length, web_seeds=['https://downloads.lastbook.org/x.zip'])
+        for why, args in (('another root', (data, self.NAME, size, '00' * 32, length)),
+                          ('another size', (data, self.NAME, size + 1, root, length)),
+                          ('another piece length', (data, self.NAME, size, root, length * 2)),
+                          ('another name', (data, 'Other.zip', size, root, length)),
+                          ('bytes after it', (data + b'x', self.NAME, size, root, length))):
+            with self.subTest(why), self.assertRaises(torrent.Bad):
+                torrent.piece_hashes(*args)
+        t = torrent.bdecode(data)                              # one piece hash changed: they no longer add up to the root
+        layer = bytearray(t[b'piece layers'][bytes.fromhex(root)])
+        layer[40] ^= 1
+        t[b'piece layers'][bytes.fromhex(root)] = bytes(layer)
+        with self.assertRaises(torrent.Bad):
+            torrent.piece_hashes(torrent.bencode(t), self.NAME, size, root, length)
+
+    def test_bdecode_is_strict(self):
+        for bad in (b'i03e', b'i-0e', b'ie', b'd1:bi1e1:ai1ee', b'd1:ai1e1:ai1ee', b'3:ab', b'l', b'i1ei2e', b'x'):
+            with self.subTest(bad), self.assertRaises(torrent.Bad):
+                torrent.bdecode(bad)
+        self.assertEqual(torrent.bdecode(b'd1:ai-1e1:bl1:xi0eee'), {b'a': -1, b'b': [b'x', 0]})
 
 
 def make_big_zip(path, members=6, size=256 * 1024):
