@@ -24,6 +24,43 @@ def _from(url, hosts, allowed):
     import urllib.parse
     return (urllib.parse.urlsplit(url).hostname or '').lower() in hosts
 NAME = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._-]{0,120}$')
+MAX_MIRRORS = 16
+
+
+def mirror_ok(url, allowed=None):
+    """A mirror: any https address with no user name or password, on port 443 (a test's own hosts: any port). Its host need not be
+    Lastbook's: a mirror is used only for a file whose pieces root is pinned, so every piece from it is checked before it counts."""
+    import urllib.parse
+    try:
+        u = urllib.parse.urlsplit(url)
+        port = u.port
+    except (ValueError, TypeError):
+        return False
+    if u.scheme != 'https' or not u.hostname or u.username or u.password or u.fragment:
+        return False
+    if allowed is not None:
+        return u.hostname.lower() in allowed
+    return port in (None, 443)
+
+
+def _sharing(x, allowed):
+    """An entry's torrent pin and mirrors, cleaned: {} if none, else {'torrent': {...}, 'mirrors': [...]}; None if wrong.
+    torrent = {url, pieces_root, piece_length}: the torrent is fetched from Lastbook's own site only, and used only if it adds up
+    to pieces_root (engine/setup/torrent.py). Mirrors without a torrent pin are left out: nothing could check their pieces."""
+    t = x.get('torrent')
+    if t is None:
+        return {}
+    if not (isinstance(t, dict) and _from(t.get('url'), LIBRARY_HOSTS, allowed) and isinstance(t.get('pieces_root'), str)
+            and SHA.match(t['pieces_root']) and _int(t.get('piece_length')) and 16384 <= t['piece_length'] <= 256 * 2 ** 20
+            and not t['piece_length'] & (t['piece_length'] - 1)):
+        return None
+    mirrors = x.get('mirrors') or []
+    if not isinstance(mirrors, list) or len(mirrors) > MAX_MIRRORS or not all(isinstance(u, str) and mirror_ok(u, allowed) for u in mirrors):
+        return None
+    out = {'torrent': {'url': t['url'], 'pieces_root': t['pieces_root'], 'piece_length': t['piece_length']}}
+    if mirrors:
+        out['mirrors'] = list(dict.fromkeys(mirrors))
+    return out
 
 
 def bundled_paths():
@@ -54,7 +91,10 @@ def validate(m, allowed=None):
             if not (isinstance(f, dict) and isinstance(f.get('name'), str) and NAME.match(f['name']) and _int(f.get('size'))
                     and isinstance(f.get('sha256'), str) and SHA.match(f['sha256']) and _from(f.get('url'), LIBRARY_HOSTS, allowed)):
                 return None
-            files.append({'name': f['name'], 'url': f['url'], 'size': f['size'], 'sha256': f['sha256'], 'kind': f.get('kind') or 'zip'})
+            share = _sharing(f, allowed)
+            if share is None:
+                return None
+            files.append({'name': f['name'], 'url': f['url'], 'size': f['size'], 'sha256': f['sha256'], 'kind': f.get('kind') or 'zip', **share})
         available = bool(p.get('available')) and bool(files)
         if available and not _int(p.get('installed_bytes')):
             return None
@@ -76,7 +116,10 @@ def validate(m, allowed=None):
                 if not (isinstance(f, dict) and isinstance(f.get('name'), str) and NAME.match(f['name']) and _int(f.get('size'))
                         and isinstance(f.get('sha256'), str) and SHA.match(f['sha256']) and _from(f.get('url'), LIBRARY_HOSTS, allowed)):
                     return None
-                files.append({'name': f['name'], 'url': f['url'], 'size': f['size'], 'sha256': f['sha256'], 'kind': f.get('kind') or 'zip'})
+                share = _sharing(f, allowed)
+                if share is None:
+                    return None
+                files.append({'name': f['name'], 'url': f['url'], 'size': f['size'], 'sha256': f['sha256'], 'kind': f.get('kind') or 'zip', **share})
             available = bool(x.get('available')) and bool(files) and all(f['size'] for f in files)
             if available and not _int(x.get('installed_bytes')):
                 return None
@@ -90,8 +133,11 @@ def validate(m, allowed=None):
                 and NAME.match(x['file']) and _int(x.get('size')) and isinstance(x.get('sha256'), str) and SHA.match(x['sha256'])
                 and _from(x.get('url'), MODEL_HOSTS, allowed) and _int(x.get('memory_bytes'))):
             return None
+        share = _sharing(x, allowed)
+        if share is None:
+            return None
         models.append({'id': x['id'], 'title': str(x.get('title') or x['id']), 'file': x['file'], 'url': x['url'], 'size': x['size'],
-                       'sha256': x['sha256'], 'memory_bytes': x['memory_bytes'], 'available': bool(x.get('available', True))})
+                       'sha256': x['sha256'], 'memory_bytes': x['memory_bytes'], 'available': bool(x.get('available', True)), **share})
     return {'version': 1, 'published': str(m.get('published') or ''), 'packs': packs, 'models': models, **collections}
 
 
@@ -118,9 +164,27 @@ def merge(bundled, fetched):
         for x in fetched.get(key, []):
             b = built.pop(x['id'], None)
             pinned = b is not None and (b.get('files') or b.get('sha256'))
-            merged.append({**b, 'available': bool(x.get('available'))} if pinned else x)
+            merged.append(_new_mirrors({**b, 'available': bool(x.get('available'))}, x) if pinned else x)
         out[key] = merged + list(built.values())
     return out
+
+
+def _new_mirrors(built, fetched):
+    """The one thing a fetched manifest may change in a pinned entry besides `available`: the mirrors of a file whose torrent the
+    app was built with, when the fetched copy pins the very same file and pieces root. Mirrors cannot change a byte (every piece is
+    checked against the pinned root), and the pin itself never changes without a new app."""
+    def same(b, f):
+        return bool(b.get('torrent') and isinstance(f.get('torrent'), dict) and b['sha256'] == f.get('sha256') and b['size'] == f.get('size')
+                    and b['torrent']['pieces_root'] == f['torrent'].get('pieces_root'))
+
+    def take(b, f):
+        out = {k: v for k, v in b.items() if k != 'mirrors'}
+        return {**out, 'mirrors': f['mirrors']} if f.get('mirrors') else out
+    if 'files' in built:
+        theirs = {f['name']: f for f in fetched.get('files') or []}
+        return {**built, 'files': [take(b, theirs[b['name']]) if b['name'] in theirs and same(b, theirs[b['name']]) else b
+                                   for b in built['files']]}
+    return take(built, fetched) if same(built, fetched) else built
 
 
 class Manifest:
@@ -163,7 +227,7 @@ class Manifest:
         return next((m for m in ms if mid in (None, m['id'])), None)
 
     def public(self):
-        strip = lambda f: {k: v for k, v in f.items() if k != 'url'}
+        strip = lambda f: {**{k: v for k, v in f.items() if k not in ('url', 'torrent', 'mirrors')}, 'shareable': 'torrent' in f}
         return {'source': self.source, 'published': self.current['published'],
                 'packs': [{**p, 'files': [strip(f) for f in p['files']]} for p in self.current['packs']],
                 'models': [strip(m) for m in self.current['models']],

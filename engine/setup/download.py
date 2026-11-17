@@ -16,6 +16,9 @@
     the file are made to agree again before going on. A file that does not match at the end is not thrown away at once: it is
     read back from the disk and checked again, and a zip (every pack and map is one) is checked member by member against the
     CRC-32s in its central directory, and only the members that are wrong are fetched again (Download._repair_zip).
+  - A file whose BitTorrent v2 pieces root is pinned in the manifest (engine/setup/torrent.py) has each piece checked against the
+    torrent's piece hashes as it is read back, so its pieces may also come from mirrors: any https host, chosen by Lastbook's
+    manifest or by the person. A mirror that sends one wrong piece is not used again; the file's SHA-256 is still the last word.
   - Nothing here runs unless the person started or resumed a download (or opened setup: one GET of the manifest).
 
 Tests pass their own `allowed` and `context` to reach a local test server. The product never does.
@@ -217,11 +220,20 @@ def _same_etag(a, b):
     return norm(a) == norm(b)
 
 
-def _open(url, start, etag, allowed, context, timeout, end=None):
+def _mirror_allowed(url, mirrors):
+    """An https address on one of this file's mirrors (host and port as listed), with no user name or password."""
+    try:
+        u = urllib.parse.urlsplit(url)
+        return u.scheme == 'https' and not u.username and not u.password and u.netloc.lower() in mirrors
+    except ValueError:
+        return False
+
+
+def _open(url, start, etag, allowed, context, timeout, end=None, mirrors=()):
     """(connection, response, final url) for a GET from byte `start` (to byte `end`, inclusive, if given), after following
-    allowed redirects."""
+    allowed redirects. mirrors: the hosts (host:port) of this file's mirrors, which may be asked as well."""
     for _ in range(MAX_REDIRECTS + 1):
-        if not url_allowed(url, allowed):
+        if not (url_allowed(url, allowed) or _mirror_allowed(url, mirrors)):
             raise Failed('network', 'Lastbook refused to download from an address it does not know.')
         u = urllib.parse.urlsplit(url)
         conn = http.client.HTTPSConnection(u.hostname, u.port or 443, timeout=timeout, context=context)
@@ -318,14 +330,21 @@ class Download:
     connections: most at once for this file (1: one stream, as before); hosts: the Hosts shared with the job's other files."""
 
     def __init__(self, url, dest, size, sha256, control, progress=lambda d, t, p: None, allowed=None, context=None, timeout=TIMEOUT,
-                 connections=1, hosts=None):
+                 connections=1, hosts=None, pieces=None, mirrors=()):
+        """pieces: the file's torrent.Pieces (its piece hashes, already checked against the pinned pieces root), or None. mirrors:
+        other https addresses of the same file, used only with pieces."""
         self.url, self.dest, self.size, self.sha256 = url, str(dest), int(size), sha256.lower()
         self.part, self.meta = self.dest + '.part', self.dest + '.part.json'
         self.control, self.progress = control, progress
         self.allowed, self.context, self.timeout = allowed, context, timeout
         self.connections = max(1, int(connections or 1))
         self.hosts = hosts
-        self.host = (urllib.parse.urlsplit(url).hostname or '').lower()
+        self.host = _netloc(url)
+        self.pieces = pieces if pieces is not None and pieces.size == self.size else None
+        self.sources = [url] + ([m for m in dict.fromkeys(mirrors) if m != url] if self.pieces else [])
+        self.mirror_hosts = frozenset(_netloc(m) for m in self.sources[1:])
+        self.banned = set()
+        self.seg = max(SEGMENT, self.pieces.length) if self.pieces else SEGMENT     # a segment holds whole torrent pieces
         self._pos = 0
 
     @property
@@ -554,10 +573,10 @@ class Download:
         byte of it was read back from the disk)."""
         open(self.part, 'ab').close()
         on_disk = os.path.getsize(self.part)
-        if meta.get('etag') and meta.get('segment') == SEGMENT:
+        if meta.get('etag') and meta.get('segment') == self.seg:
             st = Segments.from_meta(meta, self.size)
         else:
-            st = Segments(self.size, SEGMENT)
+            st = Segments(self.size, self.seg)
             if meta.get('etag'):     # a .part from one stream, or from pieces of another size: its bytes from the front are done
                 st.adopt_front(Segments.from_meta(meta, self.size).front() if meta.get('segment') else self.done_bytes())
         st.clip(on_disk)             # nothing counts as done that is not on the disk
@@ -572,8 +591,8 @@ class Download:
             while True:
                 if not workers and not st.complete():
                     self.halt.clear()
-                    workers = [threading.Thread(target=self._worker, args=(ctx,), daemon=True, name=f'setup-dl-{i}')
-                               for i in range(self.connections)]
+                    workers = [threading.Thread(target=self._worker, args=(ctx, src), daemon=True, name=f'setup-dl-{n}-{i}')
+                               for n, src in enumerate(self.sources) if src not in self.banned for i in range(self.connections)]
                     for w in workers:
                         w.start()
                 self.control.check()
@@ -582,13 +601,25 @@ class Download:
                 while cursor < st.count and st.is_done(cursor) and time.time() < slice_end:   # read back, check, and hash pieces done from the front
                     a, b = st.span(cursor)
                     h2 = h.copy()
-                    got = self._hash_range(h2, a, b)
+                    got, wrong = self._hash_range(h2, a, b)
                     expected = st.digests.get(cursor)
                     if expected is not None and got != expected:
                         print(f'setup: piece {cursor} of {self.name} is not on the disk as it arrived; fetching it again', flush=True)
                         if st.redo(cursor) > PIECE_TRIES:
                             raise Failed('checksum', f'Part of {self.name} did not stay on the disk as it was downloaded, {PIECE_TRIES} times in a row. '
                                                      'The disk, or the connection to it, may be failing. What was downloaded is kept.', kept=True)
+                        if not any(w.is_alive() for w in workers):
+                            workers = []
+                        break
+                    if wrong:                      # on the disk as it arrived, but not what the torrent pins: its source sent wrong bytes
+                        src = st.source.get(cursor)
+                        print(f'setup: piece {cursor} of {self.name} does not match its torrent piece hash; fetching it again', flush=True)
+                        if src and src != self.url and src not in self.banned:
+                            self.banned.add(src)
+                            print(f'setup: not using the mirror {_netloc(src)} for {self.name} again: it sent a wrong piece', flush=True)
+                        if st.redo(cursor) > PIECE_TRIES:
+                            raise Failed('checksum', f'Part of {self.name} kept coming out different from its published hash. '
+                                                     'What was downloaded is kept.', kept=True)
                         if not any(w.is_alive() for w in workers):
                             workers = []
                         break
@@ -642,25 +673,40 @@ class Download:
             print(f'setup: could not save the state of {self.name}: {e}', flush=True)
 
     def _hash_range(self, h, a, b):
-        """Bytes a..b-1 from the disk, added to h. Returns their own SHA-256."""
-        own = hashlib.sha256()
+        """Bytes a..b-1 from the disk, added to h. Returns (their own SHA-256, whether a torrent piece among them that ends here
+        does not match its piece hash)."""
+        own, P, piece, k, wrong = hashlib.sha256(), self.pieces, None, None, False
         with open(self.part, 'rb') as f:
             f.seek(a)
             while a < b:
                 self.control.check()
-                chunk = f.read(min(8 * CHUNK, b - a))
+                n = min(8 * CHUNK, b - a)
+                if P:
+                    k = a // P.length
+                    n = min(n, P.span(k)[1] - a)          # never across a torrent piece
+                chunk = f.read(n)
                 if not chunk:
                     break
                 h.update(chunk)
                 own.update(chunk)
+                if P:
+                    if a == P.span(k)[0]:
+                        piece = P.hasher(k)
+                    if piece is not None:
+                        piece.update(chunk)
+                        if a + len(chunk) == P.span(k)[1]:
+                            wrong = wrong or piece.digest() != P.hashes[k]
+                            piece = None
                 a += len(chunk)
-        return own.digest()
+        return own.digest(), wrong
 
-    def _worker(self, ctx):
+    def _worker(self, ctx, src=None):
+        src = src or self.url
+        host, mirror = _netloc(src), src != self.url
         st, tries, busy_in_row = self.st, 0, 0
-        while not self.halt.is_set():
+        while not self.halt.is_set() and src not in self.banned:
             try:
-                self.hosts.acquire(self.host, self.size - st.received(), self.control, self.halt)
+                self.hosts.acquire(host, self.size - st.received(), self.control, self.halt)
             except (Stopped, _Halt):
                 return
             k, progressed, busy = None, False, False
@@ -670,35 +716,40 @@ class Download:
                     if st.complete() or not st.unclaimed():
                         return
                 else:
-                    progressed = self._fetch_piece(k, ctx)
+                    progressed = self._fetch_piece(k, ctx, src)
                     tries = 0
-                    if progressed:
+                    if progressed and not mirror:
                         self.whole_answers = 0
             except Stopped:
                 return
             except _Busy:
-                self.hosts.busy_signal(self.host)
+                self.hosts.busy_signal(host)
                 busy = True
-            except _NoRanges:
-                with st.cv:                    # the same hiccup hits every connection at once: within WHOLE_GAP it counts once
-                    if time.time() - self.last_whole >= WHOLE_GAP:
-                        self.whole_answers += 1
-                        self.last_whole = time.time()
-                    give_up = self.whole_answers >= NETWORK_TRIES
-                if give_up:                    # not a passing hiccup: this server will not send pieces
-                    self.ranges_ignored = True
+            except (_NoRanges, _Restart, Failed, ssl.SSLCertVerificationError) as e:
+                if mirror:
+                    self.banned.add(src)       # a mirror that will not send pieces of this very file: the others go on without it
+                    print(f'setup: not using the mirror {host} for {self.name}: {type(e).__name__}', flush=True)
+                    return
+                if isinstance(e, _NoRanges):
+                    with st.cv:                # the same hiccup hits every connection at once: within WHOLE_GAP it counts once
+                        if time.time() - self.last_whole >= WHOLE_GAP:
+                            self.whole_answers += 1
+                            self.last_whole = time.time()
+                        give_up = self.whole_answers >= NETWORK_TRIES
+                    if give_up:                # not a passing hiccup: this server will not send pieces
+                        self.ranges_ignored = True
+                        self.halt.set()
+                        return
+                    tries += 1
+                    print(f'setup: the server sent the whole of {self.name} for piece {k}; asking again', flush=True)
+                elif isinstance(e, ssl.SSLCertVerificationError):
+                    self.error = self.error or _untrusted()
                     self.halt.set()
                     return
-                tries += 1
-                print(f'setup: the server sent the whole of {self.name} for piece {k}; asking again', flush=True)
-            except (_Restart, Failed) as e:
-                self.error = self.error or e
-                self.halt.set()
-                return
-            except ssl.SSLCertVerificationError:
-                self.error = self.error or _untrusted()
-                self.halt.set()
-                return
+                else:
+                    self.error = self.error or e
+                    self.halt.set()
+                    return
             except (OSError, http.client.HTTPException, ValueError) as e:
                 if disk_full(e):
                     self.error = self.error or Failed('no_space', 'The disk filled up while downloading. Free some space, then try again.')
@@ -709,7 +760,7 @@ class Download:
             finally:
                 if k is not None:
                     st.release(k)
-                self.hosts.release(self.host)
+                self.hosts.release(host)
             if k is None:
                 if self.halt.wait(0.5):
                     return
@@ -732,12 +783,13 @@ class Download:
                 if self.halt.wait(BACKOFF[min(tries, len(BACKOFF) - 1)]):
                     return
 
-    def _fetch_piece(self, k, ctx):
-        """Piece k from where it stands to its end, over one connection. Returns True when it is done."""
-        st = self.st
+    def _fetch_piece(self, k, ctx, src=None):
+        """Piece k from where it stands to its end, over one connection to src (the file's address, or a mirror). Returns True when
+        it is done."""
+        st, src = self.st, src or self.url
         a0, b = st.span(k)
         got = st.got.get(k, 0)
-        conn, r, _ = _open(self.url, a0 + got, None, self.allowed, ctx, self.timeout, end=b - 1)
+        conn, r, _ = _open(src, a0 + got, None, self.allowed, ctx, self.timeout, end=b - 1, mirrors=self.mirror_hosts)
         n = 0
         try:
             if r.status in (429, 503):
@@ -751,10 +803,13 @@ class Download:
             cr = _content_range(r.getheader('Content-Range'))
             new_etag = r.getheader('ETag')
             with st.cv:
-                if not cr or cr[0] != a0 + got or cr[1] != self.size or (self.etag and new_etag and not _same_etag(new_etag, self.etag)):
+                if not cr or cr[0] != a0 + got or cr[1] != self.size:
                     raise _Restart(new_etag)
-                if new_etag and not self.etag:
-                    self.etag = new_etag
+                if src == self.url:            # a mirror's ETag is its own; its pieces are checked against the torrent instead
+                    if self.etag and new_etag and not _same_etag(new_etag, self.etag):
+                        raise _Restart(new_etag)
+                    if new_etag and not self.etag:
+                        self.etag = new_etag
             hasher = st.hashers.get(k)
             if hasher is None and got == 0:
                 hasher = st.hashers[k] = hashlib.sha256()
@@ -774,7 +829,7 @@ class Download:
                     n += len(chunk)
                     st.advance(k, got)
                     self.last_byte = time.time()
-            st.finish(k)
+            st.finish(k, src)
             return True
         except _Halt:
             return False
@@ -942,6 +997,7 @@ class Segments:
             self.hashers = {}        # piece -> SHA-256 of what arrived, for a piece begun in this run
             self.digests = {}        # piece -> that SHA-256, once the piece is done, until it is read back and checked
             self.redos = {}          # piece -> times it was fetched again because the disk did not keep it
+            self.source = {}         # piece -> the address it came from in this run
             self.cv.notify_all()
 
     @classmethod
@@ -1034,10 +1090,12 @@ class Segments:
         with self.cv:
             self.got[k] = got
 
-    def finish(self, k):
+    def finish(self, k, src=None):
         with self.cv:
             self.done[k] = 1
             self.got.pop(k, None)
+            if src:
+                self.source[k] = src
             h = self.hashers.pop(k, None)
             if h is not None:
                 self.digests[k] = h.digest()
@@ -1056,8 +1114,13 @@ class Segments:
             self.hashers.pop(k, None)
             self.digests.pop(k, None)
             self.redos[k] = self.redos.get(k, 0) + 1
+            self.source.pop(k, None)
             self.cv.notify_all()
             return self.redos[k]
+
+
+def _netloc(url):
+    return (urllib.parse.urlsplit(url).netloc or '').lower()
 
 
 def _untrusted():

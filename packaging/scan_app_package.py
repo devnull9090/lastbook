@@ -261,18 +261,24 @@ def main():
     if mf.is_file():
         def urls(v):
             if isinstance(v, dict):
-                for x in v.values():
+                for k, x in v.items():
+                    if k == 'mirrors' and isinstance(v.get('torrent'), dict) and isinstance(x, list):
+                        yield from ((u, True) for u in x)      # mirrors of a file with a pinned pieces root: any https host
+                        continue
                     yield from urls(x)
             elif isinstance(v, list):
                 for x in v:
                     yield from urls(x)
             elif isinstance(v, str) and '://' in v:
-                yield v
+                yield v, False
         import urllib.parse
-        for u in urls(json.loads(mf.read_text(encoding='utf-8'))):
+        for u, mirror in urls(json.loads(mf.read_text(encoding='utf-8'))):
             setup_urls.append(u)
             parts = urllib.parse.urlsplit(u)
-            if parts.scheme != 'https' or not host_allowed(parts.hostname):
+            if mirror:
+                if parts.scheme != 'https' or not parts.hostname or parts.username or parts.password or parts.port not in (None, 443):
+                    scan.fails.append(f'setup manifest mirror that is not a plain https address: {u}')
+            elif parts.scheme != 'https' or not host_allowed(parts.hostname):
                 scan.fails.append(f'setup manifest address not on the allowed hosts: {u}')
     size = sum((root / f).stat().st_size for f in scan.files)
     result = {'folder': str(root), 'files': len(scan.files), 'bytes': size, 'modules': len(scan.modules), 'items_scanned': scan.items, 'terms': len(terms),
