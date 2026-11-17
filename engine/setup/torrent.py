@@ -213,9 +213,11 @@ def make(path, name, length, web_seeds=(), trackers=(), progress=None):
                         'infohash_v1': hashlib.sha1(encoded_info).hexdigest(), 'infohash_v2': hashlib.sha256(encoded_info).hexdigest()}
 
 
-def piece_hashes(data, name, size, pieces_root, length):
+def piece_hashes(data, name, size, pieces_root, length, infohash_v2=None):
     """The piece hashes of `name` in a torrent, used only if they add up to the pinned pieces root and the torrent agrees on
-    the size and piece length. Raises Bad otherwise. A file of one piece or less has no list: its one hash is the root."""
+    the name, size and piece length. infohash_v2 (pinned too): the SHA-256 of the torrent's whole info, which holds the v1 SHA-1
+    piece hashes that v1-only clients check against, so a torrent with the right v2 part and another v1 part is refused.
+    Raises Bad otherwise. A file of one piece or less has no list: its one hash is the root."""
     check_piece_length(length)
     root = bytes.fromhex(pieces_root)
     if len(root) != 32:
@@ -227,11 +229,14 @@ def piece_hashes(data, name, size, pieces_root, length):
         info = t[b'info']
         entry = info[b'file tree'][name.encode('utf-8')][b'']
         ok = (info[b'piece length'] == length and entry[b'length'] == size and entry[b'pieces root'] == root
-              and info.get(b'meta version') == 2)
+              and info.get(b'meta version') == 2 and len(info[b'file tree']) == 1
+              and info.get(b'name') == name.encode('utf-8') and info.get(b'length') == size)
     except (KeyError, TypeError, AttributeError):
         raise Bad('the torrent does not describe that file') from None
     if not ok:
-        raise Bad('the torrent does not match the pinned pieces root, size or piece length')
+        raise Bad('the torrent does not match the pinned pieces root, name, size or piece length')
+    if infohash_v2 is not None and hashlib.sha256(bencode(info)).hexdigest() != infohash_v2.lower():
+        raise Bad('the torrent is not the pinned one (its v2 info-hash differs)')
     count = max(1, -(-size // length))
     if count == 1:
         return Pieces(size, length, [root])

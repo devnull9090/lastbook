@@ -7,7 +7,7 @@
 Writes <zip>.torrent beside the zip. Its web seed (BEP 19) is the file's own address, so a swarm always has a seed, and it has no
 creation date, so the same file always gives the same torrent. Upload it next to the zip, at <url>.torrent.
 
-Prints the file entry's pin, {"url": <url>.torrent, "pieces_root", "piece_length"}. With --manifest it is also written into that
+Prints the file entry's pin, {"url": <url>.torrent, "pieces_root", "infohash_v2", "piece_length"}. With --manifest it is also written into that
 file's entry there (found by name) for packaging/release_manifest.py. The app trusts the torrent only as far as it adds up to that
 pieces root, and the file only as far as its SHA-256, so neither the torrent nor any mirror or peer can change a byte.
 """
@@ -42,7 +42,7 @@ def main():
     print(file=sys.stderr)
     out = path.with_name(path.name + '.torrent')
     out.write_bytes(data)
-    entry = {'url': a.url + '.torrent', 'pieces_root': pin['pieces_root'], 'piece_length': length}
+    entry = {'url': a.url + '.torrent', 'pieces_root': pin['pieces_root'], 'infohash_v2': pin['infohash_v2'], 'piece_length': length}
     print(f'{out}: {len(data):,} bytes, infohash v1 {pin["infohash_v1"]}, v2 {pin["infohash_v2"]}')
     print(f'magnet:?xt=urn:btih:{pin["infohash_v1"]}&xt=urn:btmh:1220{pin["infohash_v2"]}&dn={path.name}')
     print(json.dumps({'torrent': entry}, indent=1))

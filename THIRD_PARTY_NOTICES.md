@@ -41,6 +41,7 @@ Versions are the pins in `packaging/requirements*.txt`, `packaging/llm/*.sh`, `p
 | llama.cpp and ggml, in `lastbook-llm` (optional local AI runner) | tag b12032 (dde879bc) | MIT (Copyright the ggml authors) | https://github.com/ggml-org/llama.cpp | Checked: `LICENSE`; it ships beside the runner as `LICENSE-llama.cpp.txt` |
 | nlohmann/json, used by llama.cpp's `common/` | as vendored in b12032 | MIT | https://github.com/nlohmann/json | Checked: `licenses/LICENSE-jsonhpp` |
 | LLVM libc++, libunwind, OpenMP runtime (`libc++.dll`, `libunwind.dll`, `libomp.dll`, Windows runner) | llvm-mingw 20261020 | Apache-2.0 WITH LLVM-exception | https://github.com/mstorsjo/llvm-mingw | Checked: ships as `LICENSE-llvm-mingw.txt` |
+| rqbit (Windows build only for now; fetched by `packaging/share/fetch_rqbit.py`, pinned in `packaging/share/rqbit.json`) | 9.1.0 | Apache-2.0 (Igor Katson) | https://github.com/ikatson/rqbit | Upstream: `LICENSE` in the repository |
 
 Build-only tools (uv, CMake, Ninja, glslc/shaderc, Vulkan and SPIR-V headers, pyinstaller-hooks-contrib, altgraph,
 macholib, setuptools, packaging) are used to make the apps, and none of their code is bundled except as their licences

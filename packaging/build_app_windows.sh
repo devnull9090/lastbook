@@ -9,6 +9,9 @@
 #            (win-x64 loader). Defaults to app\webview2\. They are checked against the hashes here.
 # LLM        Folder with lastbook-llm.exe and its DLLs, from packaging/llm/build_llm_windows.sh. Defaults to derived\llm\bin-win.
 #            It goes to _internal\llm as it is, and its SHA256SUMS.txt is checked first. The model itself never ships.
+# SHARE      Optional folder with rqbit.exe from packaging/share/fetch_rqbit.py win-x64 (sharing downloads, engine/setup/share.py).
+#            Defaults to derived\share. It goes to _internal\share, checked against packaging/share/rqbit.json first. Without it
+#            the app does not offer sharing.
 # PACKS      What first-run setup can install (docs/SETUP-API.md): the packs file publish-packs writes. Defaults to
 #            derived\release\manifest-v1.json. packaging/release_manifest.py turns it into setup\manifest-v1.json, as on the Mac.
 # SMALL_FROM Optional release folder (Lastbook-Small.zip and SHA256SUMS.txt) for when the packs file has no Small pack.
@@ -27,6 +30,13 @@ LLM="${LLM:-$ROOTW\\derived\\llm\\bin-win}"
 OUTU="$(cygpath -u "$OUT")"
 ( cd "$(cygpath -u "$LLM")" && sha256sum --quiet -c SHA256SUMS.txt ) || { echo "the runner in $LLM does not match its SHA256SUMS.txt" >&2; exit 1; }
 PACKS="${PACKS:-$ROOTW\\derived\\release\\manifest-v1.json}"
+SHARE="${SHARE:-$ROOTW\\derived\\share}"
+SHARE_ARGS=()
+if [ -f "$(cygpath -u "$SHARE")/rqbit.exe" ]; then
+  "$PY" -I -B "$ROOTW\\packaging\\share\\fetch_rqbit.py" win-x64 --from "$SHARE\\rqbit.exe" --out "$OUT\\tmp\\share-check" >/dev/null \
+    || { echo "rqbit.exe in $SHARE is not the pinned release (packaging/share/rqbit.json)" >&2; exit 1; }
+  SHARE_ARGS=(--add-data "$SHARE\\rqbit.exe;share")
+fi
 mkdir -p "$OUTU/tmp/localappdata" "$OUTU/tmp/pyinstaller"
 
 # Everything the build tool caches stays in the output folder, and no bytecode lands beside the sources.
@@ -101,6 +111,7 @@ VERSIONINFO
   --add-data "$WEBVIEW2\\Microsoft.Web.WebView2.WinForms.dll;webview2" \
   --add-data "$WEBVIEW2\\WebView2Loader.dll;webview2" \
   --add-data "$LLM;llm" --add-data "$OUT\\ship\\setup\\manifest-v1.json;setup" --add-data "$ROOTW\\engine\\setup\\roots.pem;engine\\setup" --collect-submodules engine.setup \
+  "${SHARE_ARGS[@]}" \
   --hidden-import server --hidden-import retrieval --hidden-import assistant --hidden-import llm_local --hidden-import engine.update \
   --hidden-import engine.paths --hidden-import engine.library --hidden-import engine.saved_pages --hidden-import engine.quiet_onnx \
   --hidden-import bridge --hidden-import shell_windows --hidden-import clr --hidden-import _cffi_backend \

@@ -45,19 +45,19 @@ def mirror_ok(url, allowed=None):
 
 def _sharing(x, allowed):
     """An entry's torrent pin and mirrors, cleaned: {} if none, else {'torrent': {...}, 'mirrors': [...]}; None if wrong.
-    torrent = {url, pieces_root, piece_length}: the torrent is fetched from Lastbook's own site only, and used only if it adds up
-    to pieces_root (engine/setup/torrent.py). Mirrors without a torrent pin are left out: nothing could check their pieces."""
+    torrent = {url, pieces_root, infohash_v2, piece_length}: the torrent is fetched from Lastbook's own site only, and used only if
+    its info is the pinned one and its piece hashes add up to pieces_root (engine/setup/torrent.py). Mirrors without a torrent pin are left out: nothing could check their pieces."""
     t = x.get('torrent')
     if t is None:
         return {}
     if not (isinstance(t, dict) and _from(t.get('url'), LIBRARY_HOSTS, allowed) and isinstance(t.get('pieces_root'), str)
-            and SHA.match(t['pieces_root']) and _int(t.get('piece_length')) and 16384 <= t['piece_length'] <= 256 * 2 ** 20
-            and not t['piece_length'] & (t['piece_length'] - 1)):
+            and SHA.match(t['pieces_root']) and isinstance(t.get('infohash_v2'), str) and SHA.match(t['infohash_v2'])
+            and _int(t.get('piece_length')) and 16384 <= t['piece_length'] <= 256 * 2 ** 20 and not t['piece_length'] & (t['piece_length'] - 1)):
         return None
     mirrors = x.get('mirrors') or []
     if not isinstance(mirrors, list) or len(mirrors) > MAX_MIRRORS or not all(isinstance(u, str) and mirror_ok(u, allowed) for u in mirrors):
         return None
-    out = {'torrent': {'url': t['url'], 'pieces_root': t['pieces_root'], 'piece_length': t['piece_length']}}
+    out = {'torrent': {'url': t['url'], 'pieces_root': t['pieces_root'], 'infohash_v2': t['infohash_v2'], 'piece_length': t['piece_length']}}
     if mirrors:
         out['mirrors'] = list(dict.fromkeys(mirrors))
     return out
@@ -175,7 +175,8 @@ def _new_mirrors(built, fetched):
     checked against the pinned root), and the pin itself never changes without a new app."""
     def same(b, f):
         return bool(b.get('torrent') and isinstance(f.get('torrent'), dict) and b['sha256'] == f.get('sha256') and b['size'] == f.get('size')
-                    and b['torrent']['pieces_root'] == f['torrent'].get('pieces_root'))
+                    and b['torrent']['pieces_root'] == f['torrent'].get('pieces_root')
+                    and b['torrent']['infohash_v2'] == f['torrent'].get('infohash_v2'))
 
     def take(b, f):
         out = {k: v for k, v in b.items() if k != 'mirrors'}

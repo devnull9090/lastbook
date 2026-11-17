@@ -21,7 +21,7 @@ import uuid
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 
-from . import download, hardware, install, torrent
+from . import download, hardware, install, share, torrent
 from . import manifest as mf
 from .manifest import Manifest
 
@@ -107,7 +107,7 @@ class _Item:
 
 class Setup:
     def __init__(self, mode, settings_dir, default_parent, current=None, manifest=None, allowed=None, context=None,
-                 on_finish=None, pick_folder=None, look_for_libraries=None, home=None, llm_local=None, default_why=None):
+                 on_finish=None, pick_folder=None, look_for_libraries=None, home=None, llm_local=None, default_why=None, share_command=None):
         """mode: 'first-run' or 'manage'. current: the open library (manage). on_finish(folder): the app opens that library
         (it relaunches). pick_folder(): a folder the person chose, or None. look_for_libraries(): LastbookData folders found."""
         self.mode, self.current = mode, Path(current) if current else None
@@ -124,7 +124,10 @@ class Setup:
         self.ai_measure, self.measuring = None, False
         self.deleting = set()
         self.rejected = {}         # path -> (size, mtime) of a file already here that failed its SHA-256: not offered or used again
+        self.seeder = share.Seeder(share_command)
         self.job = self._load_job()
+        if self.mode == 'manage' and self.current and self._settings().get('share'):
+            threading.Thread(target=self.seed_now, daemon=True, name='setup-share').start()
 
     # ------------------------------------------------------------------------------------------------- saved state --
     def _settings(self):
@@ -432,7 +435,80 @@ class Setup:
                 'found': self.found(), 'recommend': self.recommend(hw), 'job': self.public_job(), 'sharing': self.sharing()}
 
     def sharing(self):
-        return {'mirrors': self._mirror_bases()}
+        """The person's mirrors, and sharing: whether this build can share (it has rqbit), whether it is on, and the kept files."""
+        kept = self._kept()
+        return {'mirrors': self._mirror_bases(), 'available': self.seeder.available(), 'on': bool(self._settings().get('share')),
+                'seeding': sum(len(t) for _, t in self.seeder.running()), 'kept': [{'name': f['name'], 'size': f['size']} for f, _, _, _ in kept],
+                'kept_bytes': sum(f['size'] for f, _, _, own in kept if own)}
+
+    def set_share(self, on):
+        """Turns sharing on or off. On: what is kept is seeded now, and what is downloaded from now on is kept. Off: seeding stops;
+        the kept files stay until delete_kept."""
+        if on and not self.seeder.available():
+            return {'error': 'This copy of Lastbook cannot share downloads.', 'code': 'unavailable'}
+        s = self._settings()
+        s['share'] = bool(on)
+        self._save_settings(s)
+        if on:
+            self.seed_now()
+        else:
+            self.seeder.stop()
+        return self.sharing()
+
+    def delete_kept(self):
+        """Deletes the downloads kept for sharing (the zips and their torrents in <library>.share). The library is not touched."""
+        self.seeder.stop()
+        freed = 0
+        for f, data, t, own in self._kept():
+            for path in ((data, t) if own else (t,)):
+                try:
+                    n = path.stat().st_size
+                    path.unlink()
+                    freed += n if path == data else 0
+                except OSError:
+                    pass
+        return {**self.sharing(), 'ok': True, 'freed_bytes': freed}
+
+    def _shareable(self):
+        """Every file the manifest pins a torrent for: (file entry, where its data is kept, whether that copy is setup's own)."""
+        if not self.current:
+            return []
+        out, folder = [], share.folder_for(self.current)
+        for key in ('packs', 'maps', 'address_indexes'):
+            for x in self.manifest.current.get(key, []):
+                out += [(f, folder / f['name'], True) for f in x['files'] if f.get('torrent')]
+        for m in self.manifest.current.get('models', []):
+            if m.get('torrent'):
+                out.append(({'name': m['file'], 'size': m['size'], 'torrent': m['torrent']}, self.current / 'models' / m['file'], False))
+        return out
+
+    def _kept(self):
+        """The shareable files that are here, at their size, with a torrent beside them: [(file, data, torrent, own)]."""
+        folder = share.folder_for(self.current) if self.current else None
+        out = []
+        for f, data, own in self._shareable():
+            t = folder / (f['name'] + '.torrent')
+            try:
+                if data.stat().st_size == f['size'] and t.is_file():
+                    out.append((f, data, t, own))
+            except OSError:
+                pass
+        return out
+
+    def seed_now(self):
+        """With sharing on, seeds every kept file whose torrent still adds up to its pinned pieces root."""
+        if not self._settings().get('share') or not self.current:
+            return 0
+        groups = {}
+        for f, data, t, _ in self._kept():
+            pin = f['torrent']
+            try:
+                torrent.piece_hashes(t.read_bytes(), f['name'], f['size'], pin['pieces_root'], pin['piece_length'], pin['infohash_v2'])
+            except (OSError, torrent.Bad) as e:
+                print(f'setup: not sharing {f["name"]}: {e}', flush=True)
+                continue
+            groups.setdefault(str(data.parent), []).append(str(t))
+        return self.seeder.start(groups)
 
     def _mirror_bases(self):
         return [m for m in self._settings().get('mirrors', []) if isinstance(m, str) and mf.mirror_ok(m, self.allowed)]
@@ -920,6 +996,8 @@ class Setup:
                     self._save_job()
             it = None
             self._finish_job(plan, work)
+            if self.mode == 'manage' and self._settings().get('share'):
+                self.seed_now()
         except BaseException as e:
             outcome = e
         if any(t.is_alive() for t in fetchers):     # the job stopped while other items were still downloading: they stop too
@@ -1075,7 +1153,7 @@ class Setup:
             if not data:
                 continue
             try:
-                pieces = torrent.piece_hashes(data, f['name'], f['size'], t['pieces_root'], t['piece_length'])
+                pieces = torrent.piece_hashes(data, f['name'], f['size'], t['pieces_root'], t['piece_length'], t['infohash_v2'])
             except torrent.Bad as e:
                 print(f'setup: the torrent of {f["name"]} was not used: {e}', flush=True)
                 continue
@@ -1131,9 +1209,7 @@ class Setup:
                 and current.get('map') not in (None, 'base')):
             install.copy_map(self.current, lib)
         install._write_json(lib / 'setup-pack.json', {'pack': pack['id'], 'installed': _now(), 'files': [f['name'] for f in pack['files']]})
-        for path, ours in got:
-            if ours:
-                os.unlink(path)
+        self._done_with(it, plan, work, got)
 
     def _do_map(self, it, plan, work, control, got=None):
         """A state map: download, check, unpack (map files only) into unpack-map/. With a pack, it replaces the staged library's own
@@ -1155,9 +1231,7 @@ class Setup:
             shutil.rmtree(staged, ignore_errors=True)
         else:
             plan['map_new'] = str(lib)
-        for path, ours in got:
-            if ours:
-                os.unlink(path)
+        self._done_with(it, plan, work, got)
 
     def _do_addresses(self, it, plan, work, control, got=None):
         entry = plan['addresses']
@@ -1187,8 +1261,28 @@ class Setup:
         self._set(it, 'activating')
         os.replace(lib / relative, destination)
         install._write_json(destination.with_suffix('.json'), {'files': {file['name']: file['sha256'] for file in entry['files']}})
+        self._done_with(it, plan, work, got)
+
+    def _keeping(self):
+        return bool(self._settings().get('share')) and self.seeder.available()
+
+    def _done_with(self, it, plan, work, got):
+        """The downloaded files of an item once it is in place: deleted, or with sharing on, kept with their torrent in
+        <library>.share to be seeded (a file of the person's own, `use`d, is theirs and stays where it is)."""
+        files = {f['name']: f for f in self._item_files(it, plan)}
+        keep = self._keeping()
         for path, ours in got:
-            if ours:
+            if not ours:
+                continue
+            name = Path(path).name
+            t = work / 'downloads' / (name + '.torrent')
+            if keep and files.get(name, {}).get('torrent') and t.is_file():
+                folder = share.folder_for(plan['target'])
+                folder.mkdir(parents=True, exist_ok=True)
+                os.replace(path, folder / name)
+                os.replace(t, folder / t.name)
+                print(f'setup: kept {name} to share it', flush=True)
+            else:
                 os.unlink(path)
 
     def _do_model(self, it, plan, work, control, got=None):
@@ -1208,6 +1302,11 @@ class Setup:
             os.replace(tmp, dest)
         plan['model_file'] = str(Path(plan['target']) / 'models' / m['file']) if plan['switch'] else str(dest)
         plan['model_sha256'] = m['sha256']           # what _get_file just matched: the streamed or re-read hash equalled this
+        t = work / 'downloads' / (m['file'] + '.torrent')
+        if self._keeping() and m.get('torrent') and t.is_file():     # the model is shared from the library itself
+            folder = share.folder_for(plan['target'])
+            folder.mkdir(parents=True, exist_ok=True)
+            os.replace(t, folder / t.name)
         if not plan['switch'] and self.current:      # the library open now: the AI can use it at once
             self._mark_checked(dest, m['sha256'])
 
@@ -1403,6 +1502,8 @@ ROUTES = {
     ('POST', 'delete-old'): lambda s, b: s.delete_old(b.get('path')),
     ('POST', 'remove-ai'): lambda s, b: s.remove_ai(),
     ('POST', 'mirrors'): lambda s, b: s.mirrors(b.get('add'), b.get('remove')),
+    ('POST', 'share'): lambda s, b: s.set_share(b.get('on') is True),
+    ('POST', 'share-delete'): lambda s, b: s.delete_kept(),
 }
 
 

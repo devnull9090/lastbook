@@ -16,7 +16,7 @@ sys.dont_write_bytecode = True
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[1]
 sys.path[:0] = [str(HERE.parent), str(ROOT)]
-from engine.setup import api, download, hardware, install, manifest, torrent  # noqa: E402
+from engine.setup import api, download, hardware, install, manifest, share, torrent  # noqa: E402
 from app.tests import shorttemp  # noqa: E402
 
 ALLOWED = {'127.0.0.1'}     # an address, not 'localhost': Windows tries ::1 first, which the test server does not listen on
@@ -814,6 +814,8 @@ class Torrents(unittest.TestCase):
                           ('bytes after it', (data + b'x', self.NAME, size, root, length))):
             with self.subTest(why), self.assertRaises(torrent.Bad):
                 torrent.piece_hashes(*args)
+        with self.assertRaises(torrent.Bad):                   # the right v2 part, but not the pinned info (its v1 part may differ)
+            torrent.piece_hashes(data, self.NAME, size, root, length, '00' * 32)
         t = torrent.bdecode(data)                              # one piece hash changed: they no longer add up to the root
         layer = bytearray(t[b'piece layers'][bytes.fromhex(root)])
         layer[40] ^= 1
@@ -931,7 +933,7 @@ class Mirrored(Base):
                         'files': [{'name': 'Lastbook-Small.zip', 'url': f'{self.base}/Lastbook-Small.zip', 'size': len(self.zip),
                                    'sha256': sha(self.zip), 'kind': 'zip', 'mirrors': list(mirrors),
                                    'torrent': {'url': f'{self.base}/Lastbook-Small.zip.torrent', 'pieces_root': root or self.zip_pin['pieces_root'],
-                                               'piece_length': self.PIECE}}]}],
+                                               'infohash_v2': self.zip_pin['infohash_v2'], 'piece_length': self.PIECE}}]}],
              'models': []}
         v = manifest.validate(m, ALLOWED)
         self.assertIsNotNone(v)
@@ -981,6 +983,7 @@ class Mirrored(Base):
         self.assertIsNone(with_file(torrent={**f['torrent'], 'piece_length': 3 * 16384}))       # not a power of two
         self.assertIsNone(with_file(torrent={**f['torrent'], 'pieces_root': 'xyz'}))
         self.assertIsNone(with_file(torrent={**f['torrent'], 'url': 'https://example.org/x.torrent'}))
+        self.assertIsNone(with_file(torrent={k: v for k, v in f['torrent'].items() if k != 'infohash_v2'}))
         self.assertIsNone(with_file(mirrors=['http://127.0.0.1/x']))
         no_pin = with_file(torrent=None)
         self.assertNotIn('mirrors', no_pin['packs'][0]['files'][0])                             # no pin: its mirrors are left out
@@ -989,6 +992,116 @@ class Mirrored(Base):
         repinned = with_file(torrent={**f['torrent'], 'pieces_root': 'cd' * 32}, mirrors=[f'{self.mirror_base}/evil.zip'])
         kept = manifest.merge(good, repinned)['packs'][0]['files'][0]                           # another pin: nothing taken
         self.assertEqual((kept['torrent']['pieces_root'], kept['mirrors']), (self.zip_pin['pieces_root'], f['mirrors']))
+
+
+FAKE_RQBIT = """import json, sys, time
+open(sys.argv[1], 'a', encoding='utf-8').write(json.dumps(sys.argv[2:]) + '\\n')
+time.sleep(120)
+"""
+
+
+class Sharing(Base):
+    """Keeping downloads and seeding them (engine/setup/share.py), with a stand-in for rqbit that writes down how it was started
+    and waits, as rqbit would while it seeds."""
+    PIECE = 64 * 1024
+
+    def setUp(self):
+        super().setUp()
+        path = self.tmp / 'Lastbook-Small.zip'
+        data, self.pin = torrent.make(path, 'Lastbook-Small.zip', self.PIECE)
+        self.files.data['Lastbook-Small.zip.torrent'] = data
+        self.record = self.tmp / 'rqbit-calls.txt'
+        fake = self.tmp / 'fake_rqbit.py'
+        fake.write_text(FAKE_RQBIT.replace('\\\\n', '\\n'))
+        self.command = [sys.executable, '-I', '-B', str(fake), str(self.record)]
+
+    def shared_manifest(self):
+        m = {'version': 1, 'published': '2026-11-17',
+             'packs': [{'id': 'small', 'title': 'Small', 'summary': 's', 'records': 3, 'installed_bytes': self.installed, 'available': True,
+                        'files': [{'name': 'Lastbook-Small.zip', 'url': f'{self.base}/Lastbook-Small.zip', 'size': len(self.zip),
+                                   'sha256': sha(self.zip), 'kind': 'zip',
+                                   'torrent': {'url': f'{self.base}/Lastbook-Small.zip.torrent', 'pieces_root': self.pin['pieces_root'],
+                                               'infohash_v2': self.pin['infohash_v2'], 'piece_length': self.PIECE}}]}],
+             'models': []}
+        return manifest.Manifest(bundled=manifest.validate(m, ALLOWED), remote=None, allowed=ALLOWED, context=self.ctx)
+
+    def calls(self, n=1, timeout=20):
+        t0 = time.time()
+        while time.time() - t0 < timeout:
+            try:
+                lines = [json.loads(l) for l in self.record.read_text(encoding='utf-8').splitlines() if l.strip()]
+                if len(lines) >= n:
+                    return lines
+            except OSError:
+                pass
+            time.sleep(0.05)
+        self.fail('rqbit was not started')
+
+    def install_shared(self, on=True):
+        s = self.setup(manifest=self.shared_manifest(), share_command=self.command)
+        if on:
+            self.assertTrue(s.set_share(True)['on'])
+        s.start('small', False)
+        self.assertEqual(self.wait(s)['state'], 'done')
+        lib, note = api.startup(self.settings)
+        api.opened(self.settings, lib, note)
+        return lib
+
+    def test_kept_and_seeded(self):
+        lib = self.install_shared()
+        kept = self.parent / 'LastbookData.share'
+        self.assertEqual((kept / 'Lastbook-Small.zip').read_bytes(), self.zip)              # kept, not deleted
+        self.assertTrue((kept / 'Lastbook-Small.zip.torrent').is_file())
+        self.assertFalse((self.parent / 'LastbookData.setup').exists())
+        m = self.setup('manage', current=lib, manifest=self.shared_manifest(), share_command=self.command)
+        args = self.calls()[0]                                                                # the app opened: seeding started
+        self.assertEqual(args[args.index('download'):], ['download', '--overwrite', '--disable-http-api', '-o', str(kept), str(kept / 'Lastbook-Small.zip.torrent')])
+        for flag in ('--disable-dht-persistence', '--disable-upnp-port-forward'):
+            self.assertIn(flag, args)
+        t0 = time.time()
+        while not m.seeder.running() and time.time() - t0 < 10:
+            time.sleep(0.05)
+        st = m.state()['sharing']
+        self.assertEqual((st['on'], st['seeding'], st['kept_bytes']), (True, 1, len(self.zip)))
+        self.assertEqual(m.set_share(False)['seeding'], 0)                                   # off: rqbit stops, the files stay
+        self.assertTrue((kept / 'Lastbook-Small.zip').is_file())
+        r = m.delete_kept()
+        self.assertEqual(r['freed_bytes'], len(self.zip))
+        self.assertFalse((kept / 'Lastbook-Small.zip').exists())
+        self.assertTrue((lib / 'library-data' / 'catalog.json').is_file())                  # the library is not touched
+
+    def test_off_by_default(self):
+        lib = self.install_shared(on=False)
+        self.assertFalse((self.parent / 'LastbookData.share').exists())
+        m = self.setup('manage', current=lib, manifest=self.shared_manifest(), share_command=self.command)
+        self.assertEqual(m.seed_now(), 0)
+        self.assertFalse(self.record.exists())
+
+    def test_a_kept_torrent_that_does_not_add_up_is_not_seeded(self):
+        lib = self.install_shared()
+        t = self.parent / 'LastbookData.share' / 'Lastbook-Small.zip.torrent'
+        d = torrent.bdecode(t.read_bytes())
+        d[b'info'][b'name'] = b'Other.zip'
+        t.write_bytes(torrent.bencode(d))
+        m = self.setup('manage', current=lib, manifest=self.shared_manifest(), share_command=self.command)
+        time.sleep(0.5)
+        self.assertEqual(m.seed_now(), 0)
+        self.assertFalse(self.record.exists())
+
+    def test_not_offered_without_rqbit(self):
+        with mock.patch.object(share, 'binary', lambda: None):
+            s = self.setup(manifest=self.shared_manifest())
+            self.assertFalse(s.state()['sharing']['available'])
+            self.assertEqual(s.set_share(True)['code'], 'unavailable')
+
+    def test_seeder_stops_its_processes(self):
+        seeder = share.Seeder(self.command)
+        self.assertEqual(seeder.start({str(self.tmp): [str(self.tmp / 'a.torrent'), str(self.tmp / 'b.torrent')]}, upload_bps=1000), 2)
+        args = self.calls()[0]
+        self.assertEqual(args[args.index('--ratelimit-upload') + 1], '1000')
+        self.assertEqual(len(seeder.running()), 1)
+        seeder.stop()
+        self.assertEqual(seeder.running(), [])
 
 
 class Repair(Base):

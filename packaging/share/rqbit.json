@@ -1,0 +1,10 @@
+{
+ "about": "rqbit, the BitTorrent program that seeds downloads people choose to share (engine/setup/share.py). Apache-2.0, by Igor Katson. The digests are GitHub's own for these release files; fetch_rqbit.py refuses any file that does not match.",
+ "version": "9.1.0",
+ "files": {
+  "win-x64": {"asset": "rqbit.exe", "name": "rqbit.exe", "size": 12760064, "sha256": "9fb0c0dbe63ea7ca04611039e0244e570d115e79d3a0d4ac2bba22b9d80f3cbc"},
+  "mac-universal": {"asset": "rqbit-osx-universal", "name": "rqbit", "size": 36351632, "sha256": "de978a3ddd9732181745a76d054faccd4df3e3caaae98e487292fea6637f1f73"},
+  "linux-x64": {"asset": "rqbit-linux-amd64", "name": "rqbit", "size": 28630928, "sha256": "921061a82ee6a6b26754c6367886b5b6b4ce5916d3edd5db79c6cd5f2c23499f"},
+  "linux-arm64": {"asset": "rqbit-linux-arm64", "name": "rqbit", "size": 25786784, "sha256": "5247a363df062f429e53661b7242373bf70603e93efc4d0b459017e6fd209def"}
+ }
+}
