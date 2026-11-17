@@ -386,7 +386,7 @@ class Download:
         self.seg = max(SEGMENT, self.pieces.length) if self.pieces else SEGMENT     # a segment holds whole torrent pieces
         self.swarm = swarm if self.pieces else None
         self.on_peers = on_peers or (lambda n: None)
-        self.from_back = False
+        self.from_back = self.window_back = False
         self._pos = 0
 
     @property
@@ -719,7 +719,7 @@ class Download:
         against its torrent hash and the whole against nothing yet: run() compares that SHA-256. A piece wrong in that read is
         fetched again from the servers alone, and the file read again. Returns (hash of the whole file, False)."""
         open(self.part, 'ab').close()
-        sparse = _sparse(self.part)
+        sparse = _holes(os.path.dirname(os.path.abspath(self.part))) and _sparse(self.part)   # marked only where it helps
         on_disk = os.path.getsize(self.part)
         if meta.get('etag') and meta.get('segment') == self.seg:
             st = Segments.from_meta(meta, self.size)
@@ -731,10 +731,14 @@ class Download:
         self.etag = meta.get('etag') if st.received() else None
         self.st, self.halt, self.error, self.ranges_ignored = st, threading.Event(), None, False
         self.whole_answers, self.last_byte, self.last_whole = 0, time.time(), 0.0
-        self.from_back, self.peer_bytes = False, 0
+        self.from_back, self.window_back, self.peer_bytes = False, False, 0
         if not self.swarm.start(os.path.dirname(os.path.abspath(self.part))):
             return self._run_segments(meta, ctx)      # no rqbit after all: the usual way, nothing else writes to the file
-        self.from_back = sparse                       # from the back only where far writes cost nothing (a sparse file)
+        self.from_back = sparse                       # from the back only where far writes cost nothing (a disk that keeps holes)
+        self.window_back = not sparse                 # else from the far end of the window: rqbit takes its front, and no write
+        if not sparse:                                # lands more than the window ahead
+            print(f'setup: the disk under {self.name} fills a gap when a file is written far ahead; the servers keep within '
+                  f'{self.connections * WINDOW * self.seg // 2 ** 20} MiB of the front', flush=True)
         on = True
         print(f'setup: {self.name} also comes from other people (BitTorrent) while it downloads', flush=True)
         try:
@@ -904,7 +908,7 @@ class Download:
                 return
             k, progressed, busy = None, False, False
             try:
-                k = st.claim(self.connections * WINDOW, from_back=self.from_back)
+                k = st.claim(self.connections * WINDOW, from_back=self.from_back, window_back=self.window_back)
                 if k is None:
                     if st.complete() or not st.unclaimed():
                         return
@@ -1267,9 +1271,10 @@ class Segments:
         with self.cv:
             return any(not self.done[k] and k not in self.claimed for k in range(self.count))
 
-    def claim(self, window, from_back=False):
+    def claim(self, window, from_back=False, window_back=False):
         """The lowest piece not done and not taken, if it is within `window` pieces of the first one not done. from_back: the
-        highest instead, anywhere (rqbit fills the same file from the front, and the file is sparse)."""
+        highest instead, anywhere (rqbit fills the same file from the front, and the file is sparse). window_back: the highest
+        within the window (rqbit takes its front, on a disk where writing far ahead costs)."""
         with self.cv:
             if from_back:
                 for k in range(self.count - 1, -1, -1):
@@ -1279,6 +1284,12 @@ class Segments:
                 return None
             first = next((k for k in range(self.count) if not self.done[k]), None)
             if first is None:
+                return None
+            if window_back:
+                for k in range(min(self.count, first + window) - 1, first - 1, -1):
+                    if not self.done[k] and k not in self.claimed:
+                        self.claimed.add(k)
+                        return k
                 return None
             for k in range(first, min(self.count, first + window)):
                 if not self.done[k] and k not in self.claimed:
@@ -1338,6 +1349,40 @@ def _sparse(path):
             return bool(k32.DeviceIoControl(wintypes.HANDLE(msvcrt.get_osfhandle(f.fileno())), 0x900C4, None, 0, None, 0, ctypes.byref(n), None))
     except (OSError, AttributeError, ValueError):
         return False
+
+
+def _allocated(path):
+    """Bytes a file takes on its disk (less than its length where it has holes)."""
+    if os.name == 'nt':
+        import ctypes
+        hi = ctypes.c_ulong()
+        lo = ctypes.windll.kernel32.GetCompressedFileSizeW(str(path), ctypes.byref(hi))
+        if lo == 0xFFFFFFFF and ctypes.windll.kernel32.GetLastError():
+            raise OSError('GetCompressedFileSizeW')
+        return (hi.value << 32) + lo
+    return os.stat(path).st_blocks * 512
+
+
+def _holes(folder):
+    """Whether the disk under `folder` keeps a gap in a sparse file empty, so writing far ahead costs nothing. Some network shares
+    take the sparse mark and fill the gap anyway: measured on a NAS share, 1 MiB written at 4 GiB took 22 s marked sparse or not,
+    and the file then took all 4 GiB. A probe (4 KiB written at 64 MiB into a file marked sparse) tells them apart."""
+    probe = os.path.join(folder, '.lastbook-holes')
+    try:
+        open(probe, 'wb').close()
+        if not _sparse(probe):
+            return False
+        with open(probe, 'r+b', buffering=0) as f:
+            f.seek(64 * 2 ** 20)
+            f.write(b'h' * 4096)
+        return _allocated(probe) < 8 * 2 ** 20
+    except OSError:
+        return False
+    finally:
+        try:
+            os.unlink(probe)
+        except OSError:
+            pass
 
 
 def _netloc(url):

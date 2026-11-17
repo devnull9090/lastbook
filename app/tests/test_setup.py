@@ -981,6 +981,21 @@ class Swarming(Base):
         self.assertLess(time.time() - stopped[0], 3)
         self.assertIsNone(swarm.proc)
 
+    def test_a_disk_without_holes_is_filled_from_the_front(self):
+        """A disk that fills the gap when a file is written far ahead (some network shares): the servers take pieces from the
+        front too, and the file still comes out right with rqbit writing into it."""
+        self.setup_dirs()
+        self.assertTrue(download._holes(str(self.tmp)))             # this disk keeps holes: the probe says so
+        self.files.pace = 0.03
+        with mock.patch.object(download, '_holes', lambda folder: False):
+            d = self.dl()
+            self.assertEqual(Path(d.run()).read_bytes(), self.model)
+        self.assertFalse(d.from_back)
+        starts = [a // self.PIECE for a, _ in _requested(self.files.log, 'model.gguf')]
+        window = d.connections * download.WINDOW
+        self.assertEqual(sorted(starts[:2]), [window - 2, window - 1])          # the far end of the window, rqbit the front
+        self.assertTrue(self.peers and self.peers[-1] > 0, 'nothing came from other people')
+
     def test_without_rqbit_the_usual_order(self):
         """rqbit does not start: the download goes the usual way, from the front, as if BitTorrent were off."""
         self.setup_dirs()
