@@ -231,6 +231,7 @@ class Swarm:
         except OSError as e:
             print(f'setup: BitTorrent could not start: {e}', flush=True)
             return False
+        atexit.register(self.stop)            # ended at a normal exit too, where nothing else ties it to Lastbook
         t0 = time.time()
         while time.time() - t0 < 20 and self.proc.poll() is None:
             r = download.local_api(self.port, self.secret, 'GET', '/stats')
@@ -272,6 +273,7 @@ class Swarm:
         p, self.proc = self.proc, None
         if p is None:
             return
+        atexit.unregister(self.stop)
         if self.tally is not None and p.poll() is None:
             self.tally.add({('swarm', p.pid, self.port): uploaded(self.port, self.secret)})
         if p.poll() is None:

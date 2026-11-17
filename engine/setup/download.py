@@ -719,7 +719,7 @@ class Download:
         against its torrent hash and the whole against nothing yet: run() compares that SHA-256. A piece wrong in that read is
         fetched again from the servers alone, and the file read again. Returns (hash of the whole file, False)."""
         open(self.part, 'ab').close()
-        _sparse(self.part)
+        sparse = _sparse(self.part)
         on_disk = os.path.getsize(self.part)
         if meta.get('etag') and meta.get('segment') == self.seg:
             st = Segments.from_meta(meta, self.size)
@@ -730,17 +730,16 @@ class Download:
         st.clip(on_disk)
         self.etag = meta.get('etag') if st.received() else None
         self.st, self.halt, self.error, self.ranges_ignored = st, threading.Event(), None, False
-        self.whole_answers, self.last_byte = 0, time.time()
-        self.from_back, self.peer_bytes = True, 0
+        self.whole_answers, self.last_byte, self.last_whole = 0, time.time(), 0.0
+        self.from_back, self.peer_bytes = False, 0
         if not self.swarm.start(os.path.dirname(os.path.abspath(self.part))):
             return self._run_segments(meta, ctx)      # no rqbit after all: the usual way, nothing else writes to the file
+        self.from_back = sparse                       # from the back only where far writes cost nothing (a sparse file)
         on = True
         print(f'setup: {self.name} also comes from other people (BitTorrent) while it downloads', flush=True)
         try:
             while True:
                 on = self._fill(ctx, on)
-                if on is None:              # the server will not send pieces: one stream, read back whole by run()
-                    return self._fall_back_to_stream(hashlib.sha256(), 0, ctx)
                 if self.swarm.proc is not None:
                     self.swarm.stop()       # rqbit's process has ended: from here only this writes to the file
                 on = False
@@ -760,13 +759,14 @@ class Download:
             self._save_segments()
 
     def _fill(self, ctx, on):
-        """Runs the connections (and with `on`, takes rqbit's pieces) until every piece is done. Returns whether rqbit is still on,
-        or None if the server will not send pieces."""
+        """Runs the connections (and with `on`, takes rqbit's pieces) until every piece is done. Returns whether rqbit is still on.
+        The file is never cut short here: what is on the disk from the back and from rqbit stays. Servers that will not send
+        pieces, or keep failing, are asked again later while rqbit goes on; without rqbit that stops the download, the file kept."""
         st, workers = self.st, []
-        last_save = last_progress = last_harvest = 0
+        last_save = last_progress = last_harvest = retry_at = 0
         try:
             while True:
-                if not workers and not st.complete():
+                if not workers and not st.complete() and time.time() >= retry_at:
                     self.halt.clear()
                     workers = [threading.Thread(target=self._worker, args=(ctx, src), daemon=True, name=f'setup-dl-{n}-{i}')
                                for n, src in enumerate(self.sources) if src not in self.banned for i in range(self.connections)]
@@ -795,9 +795,12 @@ class Download:
                     return on
                 if workers and not any(w.is_alive() for w in workers):
                     if self.ranges_ignored:
-                        if on:
-                            self.swarm.stop()
-                        return None
+                        if not on:
+                            raise Failed('network', 'The download server will not send parts of the file right now. '
+                                                    'What was downloaded is kept: try again later.')
+                        print(f'setup: the server will not send pieces of {self.name} now; BitTorrent goes on, the server is asked again later', flush=True)
+                        self.ranges_ignored, self.whole_answers, workers, retry_at = False, 0, [], now + BACKOFF[-1]
+                        continue
                     if isinstance(self.error, _Restart):
                         print(f'setup: the file on the server changed; starting {self.name} over', flush=True)
                         if on:
@@ -811,9 +814,8 @@ class Download:
                     if self.error:
                         raise self.error
                     if not st.complete():
-                        if on:                    # the servers gave up, but other people may still have it
-                            workers = []
-                            self.halt.wait(BACKOFF[-1])
+                        if on:                    # the servers gave up, but other people may still have it: ask them again later
+                            workers, retry_at = [], now + BACKOFF[-1]
                             continue
                         raise Failed('network', 'The connection kept breaking. Check the internet connection, then try again.')
                     workers = []
@@ -1320,9 +1322,10 @@ class Segments:
 
 def _sparse(path):
     """Windows: the file is marked sparse, so a write far from the front does not first fill everything before it with zeros
-    (measured on NTFS: 17 s to write at 8 GiB into a plain file, 0.02 s into a sparse one). Elsewhere nothing to do."""
+    (measured on NTFS: 17 s to write at 8 GiB into a plain file, 0.02 s into a sparse one). Returns whether that is so: elsewhere
+    files have holes already; a Windows disk that cannot do it (some network shares) says no."""
     if os.name != 'nt':
-        return
+        return True
     try:
         import ctypes
         import msvcrt
@@ -1332,9 +1335,9 @@ def _sparse(path):
                                         ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p]
         with open(path, 'r+b') as f:
             n = wintypes.DWORD()
-            k32.DeviceIoControl(wintypes.HANDLE(msvcrt.get_osfhandle(f.fileno())), 0x900C4, None, 0, None, 0, ctypes.byref(n), None)
+            return bool(k32.DeviceIoControl(wintypes.HANDLE(msvcrt.get_osfhandle(f.fileno())), 0x900C4, None, 0, None, 0, ctypes.byref(n), None))
     except (OSError, AttributeError, ValueError):
-        pass
+        return False
 
 
 def _netloc(url):
