@@ -830,6 +830,133 @@ class Torrents(unittest.TestCase):
         self.assertEqual(torrent.bdecode(b'd1:ai-1e1:bl1:xi0eee'), {b'a': -1, b'b': [b'x', 0]})
 
 
+class Swarming(Base):
+    """Downloading from other people too: a stand-in for rqbit writes the file's pieces from the front into the very file being
+    downloaded, while the connections take pieces from the back. Nothing it writes counts until it matches the torrent, and the
+    file is judged by a full read once it has stopped."""
+    PIECE = 64 * 1024
+
+    def setUp(self):
+        super().setUp()
+        for name, value in (('SEGMENT', self.PIECE), ('SEGMENTED_MIN', 0), ('WINDOW', 4), ('HARVEST_EVERY', 0.05)):
+            p = mock.patch.object(download, name, value)
+            p.start()
+            self.addCleanup(p.stop)
+        src = self.tmp / 'model-source.gguf'
+        src.write_bytes(self.model)
+        self.torrent, pin = torrent.make(src, 'model.gguf', self.PIECE)
+        self.pieces = torrent.piece_hashes(self.torrent, 'model.gguf', len(self.model), pin['pieces_root'], self.PIECE, pin['infohash_v2'])
+        self.record = self.tmp / 'rqbit-calls.txt'
+        fake = self.tmp / 'fake_rqbit.py'
+        fake.write_text(FAKE_RQBIT)
+        self.command = [sys.executable, '-I', '-B', str(fake), str(self.record)]
+        env = mock.patch.dict(os.environ, {'FAKE_SWARM_SOURCE': str(src), 'FAKE_SWARM_NAME': 'model.gguf', 'FAKE_SWARM_PIECE': str(self.PIECE),
+                                           'FAKE_SWARM_PACE': '0.02'})
+        env.start()
+        self.addCleanup(env.stop)
+        self.want, self.peers = True, []
+
+    def dl(self, control=None):
+        self.swarm = share.Swarm(self.torrent, wanted=lambda: self.want, command=self.command)
+        return download.Download(f'{self.base}/model.gguf', self.tmp / 'dl' / 'model.gguf', len(self.model), sha(self.model),
+                                 control or download.Control(), allowed=ALLOWED, context=self.ctx, connections=2, pieces=self.pieces,
+                                 swarm=self.swarm, part=self.tmp / 'dl' / 'swarm' / 'model.gguf', on_peers=self.peers.append)
+
+    def setup_dirs(self):
+        (self.tmp / 'dl' / 'swarm').mkdir(parents=True, exist_ok=True)
+
+    def test_people_and_servers_together(self):
+        self.setup_dirs()
+        self.files.pace = 0.05
+        d = self.dl()
+        self.assertEqual(Path(d.run()).read_bytes(), self.model)
+        self.assertTrue(self.peers and self.peers[-1] > 0, 'nothing came from other people')
+        asked = _requested(self.files.log, 'model.gguf')
+        self.assertEqual(sorted(a // self.PIECE for a, _ in asked[:2]), [d.st.count - 2, d.st.count - 1])   # the servers from the back
+        self.assertLess(sum(b - a + 1 for a, b in asked), len(self.model))       # and not every piece from them
+        self.assertIsNone(self.swarm.proc)                                       # rqbit ended before the file was judged
+        added = json.loads(Path(str(self.record) + '.added').read_text().splitlines()[0])
+        self.assertEqual((added['overwrite'], Path(added['output_folder'])), ('true', self.tmp / 'dl' / 'swarm'))
+        self.assertFalse((self.tmp / 'dl' / 'swarm' / 'model.gguf').exists())   # moved to its place, the one copy
+
+    def test_a_bad_peers_piece_is_never_taken(self):
+        self.setup_dirs()
+        self.files.pace = 0.05
+        with mock.patch.dict(os.environ, {'FAKE_SWARM_BAD': '3'}):
+            d = self.dl()
+            self.assertEqual(Path(d.run()).read_bytes(), self.model)
+        self.assertTrue(any(a <= 3 * self.PIECE + 7 <= b for a, b in _requested(self.files.log, 'model.gguf')))
+
+    def test_damage_after_a_piece_was_taken_is_caught_by_the_last_read(self):
+        """rqbit writes a bad peer's bytes before it checks them, even over a piece already taken: the full read once it has
+        stopped finds the piece, and only that piece is fetched again, from the servers."""
+        self.setup_dirs()
+        self.files.pace = 0.05
+        d = self.dl()
+        part, flipped = self.tmp / 'dl' / 'swarm' / 'model.gguf', []
+
+        def damage():
+            t0 = time.time()
+            while time.time() - t0 < 20:
+                st = getattr(d, 'st', None)
+                if st is not None and st.is_done(2) and part.exists():
+                    with open(part, 'r+b') as f:
+                        f.seek(2 * self.PIECE + 100)
+                        b = f.read(1)
+                        f.seek(2 * self.PIECE + 100)
+                        f.write(bytes([b[0] ^ 0xff]))
+                    flipped.append(1)
+                    return
+                time.sleep(0.01)
+        threading.Thread(target=damage, daemon=True).start()
+        self.assertEqual(Path(d.run()).read_bytes(), self.model)
+        self.assertEqual(flipped, [1])
+        self.assertTrue(any(a <= 2 * self.PIECE + 100 <= b for a, b in _requested(self.files.log, 'model.gguf')))
+
+    def test_turning_bittorrent_off_midway(self):
+        self.setup_dirs()
+        self.files.pace = 0.03
+        with mock.patch.dict(os.environ, {'FAKE_SWARM_PACE': '0.2'}):
+            d = self.dl()
+            threading.Timer(0.5, lambda: setattr(self, 'want', False)).start()
+            self.assertEqual(Path(d.run()).read_bytes(), self.model)
+        self.assertIsNone(self.swarm.proc)
+
+    def test_pause_ends_rqbit_and_a_new_run_goes_on(self):
+        self.setup_dirs()
+        self.files.pace = 0.05
+        c = download.Control()
+        d = self.dl(control=c)
+        threading.Timer(0.6, c.stop, ['paused']).start()
+        with self.assertRaises(download.Stopped):
+            d.run()
+        self.assertIsNone(self.swarm.proc)
+        self.files.pace = 0
+        self.assertEqual(Path(self.dl().run()).read_bytes(), self.model)
+
+    def test_a_job_downloads_from_people(self):
+        """The whole job with BitTorrent on: the pack comes partly from other people, and the item says how much."""
+        zpath = self.tmp / 'Lastbook-Small.zip'
+        data, pin = torrent.make(zpath, 'Lastbook-Small.zip', self.PIECE)
+        self.files.data['Lastbook-Small.zip.torrent'] = data
+        self.files.pace = 0.03
+        m = {'version': 1, 'published': '2026-11-17',
+             'packs': [{'id': 'small', 'title': 'Small', 'summary': 's', 'records': 3, 'installed_bytes': self.installed, 'available': True,
+                        'files': [{'name': 'Lastbook-Small.zip', 'url': f'{self.base}/Lastbook-Small.zip', 'size': len(self.zip),
+                                   'sha256': sha(self.zip), 'kind': 'zip',
+                                   'torrent': {'url': f'{self.base}/Lastbook-Small.zip.torrent', 'pieces_root': pin['pieces_root'],
+                                               'infohash_v2': pin['infohash_v2'], 'piece_length': self.PIECE}}]}], 'models': []}
+        mf = manifest.Manifest(bundled=manifest.validate(m, ALLOWED), remote=None, allowed=ALLOWED, context=self.ctx)
+        with mock.patch.dict(os.environ, {'FAKE_SWARM_SOURCE': str(zpath), 'FAKE_SWARM_NAME': 'Lastbook-Small.zip'}):
+            s = self.setup(manifest=mf, share_command=self.command)
+            s.set_share(True)
+            s.start('small', False)
+            j = self.wait(s)
+        self.assertEqual(j['state'], 'done', j)
+        self.assertGreater(j['items'][0].get('from_peers', 0), 0)
+        s.seeder.stop()
+
+
 def make_big_zip(path, members=6, size=256 * 1024):
     """A zip like a pack, several members stored and one deflated. Returns the bytes and (name, header_offset, data length) of each."""
     with zipfile.ZipFile(path, 'w', zipfile.ZIP_STORED) as z:
@@ -1030,7 +1157,7 @@ class Mirrored(Base):
 
 
 FAKE_RQBIT = r'''
-import base64, json, os, sys, time
+import base64, json, os, sys, threading, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 record, args = sys.argv[1], sys.argv[2:]
 open(record, 'a', encoding='utf-8').write(json.dumps(args) + '\n')
@@ -1049,9 +1176,23 @@ class H(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def do_POST(self):
+        if self.headers.get('Authorization') != auth:
+            return self.answer(401, {'error': 'unauthorized'})
+        body = self.rfile.read(int(self.headers.get('Content-Length') or 0))
+        if self.path.startswith('/torrents?'):
+            from urllib.parse import parse_qs, urlsplit
+            q = parse_qs(urlsplit(self.path).query)
+            open(record + '.added', 'a', encoding='utf-8').write(json.dumps({k: v[0] for k, v in q.items()}) + '\n')
+            threading.Thread(target=swarm, args=(q['output_folder'][0],), daemon=True).start()
+            return self.answer(200, {'id': 0, 'details': {}})
+        return self.answer(404, {})
+
     def do_GET(self):
         if self.headers.get('Authorization') != auth:
             return self.answer(401, {'error': 'unauthorized'})
+        if self.path == '/torrents/0/stats/v1':
+            return self.answer(200, {'state': 'live', 'live': {'snapshot': {'fetched_bytes': WROTE[0]}}})
         if self.path == '/stats':
             try:
                 up = int(open(record + '.uploaded').read())
@@ -1059,6 +1200,30 @@ class H(BaseHTTPRequestHandler):
                 up = 0
             return self.answer(200, {'counters': {'uploaded_bytes': up, 'fetched_bytes': 0}})
         return self.answer(404, {})
+
+
+WROTE = [0]
+
+
+def swarm(folder):
+    # like rqbit in a swarm: the file's pieces from the front, into the very file Lastbook downloads into, never cut short;
+    # FAKE_SWARM_SKIP: pieces no peer has; FAKE_SWARM_BAD: pieces a bad peer sends wrong (left wrong)
+    src = open(os.environ['FAKE_SWARM_SOURCE'], 'rb').read()
+    piece, pace = int(os.environ['FAKE_SWARM_PIECE']), float(os.environ.get('FAKE_SWARM_PACE', '0.02'))
+    skip = {int(x) for x in os.environ.get('FAKE_SWARM_SKIP', '').split(',') if x}
+    bad = {int(x) for x in os.environ.get('FAKE_SWARM_BAD', '').split(',') if x}
+    path = os.path.join(folder, os.environ['FAKE_SWARM_NAME'])
+    for k in range(-(-len(src) // piece)):
+        time.sleep(pace)
+        if k in skip:
+            continue
+        b = bytearray(src[k * piece:(k + 1) * piece])
+        if k in bad:
+            b[7] ^= 0xff
+        with open(path, 'r+b' if os.path.exists(path) else 'w+b') as f:
+            f.seek(k * piece)
+            f.write(b)
+        WROTE[0] += len(b)
 
 
 if '--http-api-listen-addr' in args:

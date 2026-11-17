@@ -107,7 +107,8 @@ class _Item:
 
 class Setup:
     def __init__(self, mode, settings_dir, default_parent, current=None, manifest=None, allowed=None, context=None,
-                 on_finish=None, pick_folder=None, look_for_libraries=None, home=None, llm_local=None, default_why=None, share_command=None):
+                 on_finish=None, pick_folder=None, look_for_libraries=None, home=None, llm_local=None, default_why=None, share_command=None,
+                 swarm_extra=(), swarm_peers=()):
         """mode: 'first-run' or 'manage'. current: the open library (manage). on_finish(folder): the app opens that library
         (it relaunches). pick_folder(): a folder the person chose, or None. look_for_libraries(): LastbookData folders found."""
         self.mode, self.current = mode, Path(current) if current else None
@@ -125,6 +126,7 @@ class Setup:
         self.deleting = set()
         self.rejected = {}         # path -> (size, mtime) of a file already here that failed its SHA-256: not offered or used again
         self.seeder = share.Seeder(share_command, share.Tally(self.settings_dir / 'setup' / 'shared.json'))
+        self.share_command, self.swarm_extra, self.swarm_peers = share_command, list(swarm_extra), list(swarm_peers)   # tests: rqbit's stand-in
         self.job = self._load_job()
         if self.mode == 'manage' and self.current and self._settings().get('share'):
             threading.Thread(target=self.seed_now, daemon=True, name='setup-share').start()
@@ -1121,10 +1123,16 @@ class Setup:
         while True:
             self._set(it, 'downloading')
             pieces = self._pieces_for(f, work)
+            swarm, part = self._swarm_for(f, work, pieces)
+            peers_before = it.get('from_peers', 0)
+
+            def peers(n, before=peers_before):
+                it['from_peers'] = before + n
             d = download.Download(f['url'], dest, f['size'], f['sha256'], control,
                                   lambda done, total, phase: tracker.progress(offset + done, it['bytes_total'], phase),
                                   allowed=self.allowed, context=self.context, connections=download.CONNECTIONS,
-                                  hosts=self.hosts, pieces=pieces, mirrors=self._mirrors_for(f) if pieces else ())
+                                  hosts=self.hosts, pieces=pieces, mirrors=self._mirrors_for(f) if pieces else (),
+                                  swarm=swarm, part=part, on_peers=peers)
             try:
                 return d.run(), True
             except download.BadChecksum:
@@ -1164,6 +1172,23 @@ class Setup:
                     pass
             return pieces
         return None
+
+    def _swarm_for(self, f, work, pieces):
+        """With BitTorrent on, a file with a pinned torrent big enough to come in pieces also comes from other people: (share.Swarm,
+        where the file is downloaded to, in a folder of its own that rqbit writes into too). Otherwise (None, None), and a file left
+        in that folder by an earlier run goes back to <name>.part, so the download goes on from what is there."""
+        downloads = work / 'downloads'
+        in_swarm, part = downloads / 'swarm' / f['name'], downloads / (f['name'] + '.part')
+        t = downloads / (f['name'] + '.torrent')
+        if pieces and self._settings().get('share') and self.seeder.available() and f['size'] > download.SEGMENTED_MIN and t.is_file():
+            in_swarm.parent.mkdir(parents=True, exist_ok=True)
+            if part.exists() and not in_swarm.exists():
+                os.replace(part, in_swarm)
+            return share.Swarm(t.read_bytes(), wanted=lambda: bool(self._settings().get('share')), tally=self.seeder.tally,
+                               command=self.share_command, extra=self.swarm_extra, peers=self.swarm_peers), in_swarm
+        if in_swarm.exists() and not part.exists():
+            os.replace(in_swarm, part)
+        return None, None
 
     def _mirrors_for(self, f):
         """The manifest's mirrors of a file, then the person's own (a mirror of Lastbook's site: the file's path is added to it)."""

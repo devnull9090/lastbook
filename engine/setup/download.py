@@ -19,6 +19,10 @@
   - A file whose BitTorrent v2 pieces root is pinned in the manifest (engine/setup/torrent.py) has each piece checked against the
     torrent's piece hashes as it is read back, so its pieces may also come from mirrors: any https host, chosen by Lastbook's
     manifest or by the person. A mirror that sends one wrong piece is not used again; the file's SHA-256 is still the last word.
+  - With BitTorrent on (engine/setup/share.py), a file with a pinned torrent also comes from other people: an rqbit of its own
+    writes into the very same file from the front while these connections work from the back (Download._run_swarm). rqbit
+    writes before it checks, so a piece counts only when it matches its torrent hash on the disk, and once every piece is in,
+    rqbit is stopped and the file is judged by a full read, every piece and the whole SHA-256, with nothing else writing.
   - Plain HTTP goes to one place only: 127.0.0.1, to the rqbit Lastbook itself started for sharing (engine/setup/share.py), with
     a password made for that run (local_api). Nothing else is reached that way, and its answers are only read as numbers.
   - Nothing here runs unless the person started or resumed a download (or opened setup: one GET of the manifest).
@@ -67,6 +71,8 @@ SEGMENTED_MIN = 4 * SEGMENT
 WINDOW = 4                          # segments per connection that may be done ahead of the first one not yet done
 WHOLE_GAP = 10                      # seconds: 200s to pieces within this count as one (all the connections see the same hiccup)
 PIECE_TRIES = 3                     # a piece that does not stay on the disk as it arrived this many times: the disk is failing
+HARVEST_EVERY = 2.0                 # seconds between looks at what rqbit has put on the disk
+HARVEST_MAX = 64                    # pieces looked at each time, from the first one not done
 STALL = 600                         # seconds with no byte from any connection before 503s count as failures
 REPAIR_MIN = 256 * 1024 * 1024      # a zip at least this big that fails its check is repaired in place, not downloaded again
 TAIL = 1024 * 1024                  # the end of a zip fetched first when repairing: its end-of-central-directory records
@@ -340,20 +346,19 @@ def _write_all(f, b):
 
 
 def done_on_disk(dest):
-    """Bytes of <dest> downloaded so far, from its .part and .part.json (the whole size once it is complete)."""
+    """Bytes of <dest> downloaded so far, from its .part.json (and its .part: the whole size once it is complete)."""
     dest = str(dest)
     try:
         return os.path.getsize(dest)
     except OSError:
         pass
     meta = _load_meta(dest + '.part.json')
+    if meta.get('segment'):                      # the data may be elsewhere (BitTorrent's folder): the .json says what is done
+        return Segments.from_meta(meta, int(meta.get('size') or 0)).received()
     try:
-        size = os.path.getsize(dest + '.part')
+        return os.path.getsize(dest + '.part')
     except OSError:
         return 0
-    if meta.get('segment'):
-        return min(Segments.from_meta(meta, int(meta.get('size') or 0)).received(), size)
-    return size
 
 
 class Download:
@@ -363,11 +368,12 @@ class Download:
     connections: most at once for this file (1: one stream, as before); hosts: the Hosts shared with the job's other files."""
 
     def __init__(self, url, dest, size, sha256, control, progress=lambda d, t, p: None, allowed=None, context=None, timeout=TIMEOUT,
-                 connections=1, hosts=None, pieces=None, mirrors=()):
+                 connections=1, hosts=None, pieces=None, mirrors=(), swarm=None, part=None, on_peers=None):
         """pieces: the file's torrent.Pieces (its piece hashes, already checked against the pinned pieces root), or None. mirrors:
-        other https addresses of the same file, used only with pieces."""
+        other https addresses of the same file, used only with pieces. swarm: a share.Swarm to take pieces from other people too
+        (only with pieces), writing into `part`, the file being downloaded; on_peers(n) hears the bytes taken from them."""
         self.url, self.dest, self.size, self.sha256 = url, str(dest), int(size), sha256.lower()
-        self.part, self.meta = self.dest + '.part', self.dest + '.part.json'
+        self.part, self.meta = str(part) if part else self.dest + '.part', self.dest + '.part.json'
         self.control, self.progress = control, progress
         self.allowed, self.context, self.timeout = allowed, context, timeout
         self.connections = max(1, int(connections or 1))
@@ -378,6 +384,9 @@ class Download:
         self.mirror_hosts = frozenset(_netloc(m) for m in self.sources[1:])
         self.banned = set()
         self.seg = max(SEGMENT, self.pieces.length) if self.pieces else SEGMENT     # a segment holds whole torrent pieces
+        self.swarm = swarm if self.pieces else None
+        self.on_peers = on_peers or (lambda n: None)
+        self.from_back = False
         self._pos = 0
 
     @property
@@ -426,7 +435,9 @@ class Download:
         if own:
             self.hosts = Hosts(most=self.connections, start=self.connections)
         try:
-            if self.connections > 1 and self.size > SEGMENTED_MIN:
+            if self.swarm and self.connections > 1 and self.size > SEGMENTED_MIN:
+                h, fetched = self._run_swarm(meta, ctx)
+            elif self.connections > 1 and self.size > SEGMENTED_MIN:
                 h, fetched = self._run_segments(meta, ctx)
             else:
                 h, fetched = self._run_stream(meta, ctx)
@@ -699,6 +710,150 @@ class Download:
             self._save_segments()
         return h, False
 
+    # -------------------------------------------------------------------------------------------- with other people --
+    def _run_swarm(self, meta, ctx):
+        """The file from its own address, its mirrors and other people at once. rqbit (self.swarm) writes into this very file,
+        fetching from the front; the connections here take pieces from the back. rqbit writes what a peer sends before it checks
+        it, so a piece of its counts only when it matches its torrent piece hash on the disk (_harvest), and nothing seen while it
+        runs is proof: once every piece is in, rqbit is stopped (its process has ended) and the whole file is read, each piece
+        against its torrent hash and the whole against nothing yet: run() compares that SHA-256. A piece wrong in that read is
+        fetched again from the servers alone, and the file read again. Returns (hash of the whole file, False)."""
+        open(self.part, 'ab').close()
+        _sparse(self.part)
+        on_disk = os.path.getsize(self.part)
+        if meta.get('etag') and meta.get('segment') == self.seg:
+            st = Segments.from_meta(meta, self.size)
+        else:
+            st = Segments(self.size, self.seg)
+            if meta.get('etag'):
+                st.adopt_front(Segments.from_meta(meta, self.size).front() if meta.get('segment') else self.done_bytes())
+        st.clip(on_disk)
+        self.etag = meta.get('etag') if st.received() else None
+        self.st, self.halt, self.error, self.ranges_ignored = st, threading.Event(), None, False
+        self.whole_answers, self.last_byte = 0, time.time()
+        self.from_back, self.peer_bytes = True, 0
+        if not self.swarm.start(os.path.dirname(os.path.abspath(self.part))):
+            return self._run_segments(meta, ctx)      # no rqbit after all: the usual way, nothing else writes to the file
+        on = True
+        print(f'setup: {self.name} also comes from other people (BitTorrent) while it downloads', flush=True)
+        try:
+            while True:
+                on = self._fill(ctx, on)
+                if on is None:              # the server will not send pieces: one stream, read back whole by run()
+                    return self._fall_back_to_stream(hashlib.sha256(), 0, ctx)
+                if self.swarm.proc is not None:
+                    self.swarm.stop()       # rqbit's process has ended: from here only this writes to the file
+                on = False
+                print(f'setup: reading the whole of {self.name} back to check it, now that BitTorrent has stopped', flush=True)
+                h, bad = self._verify_all()
+                if not bad:
+                    return h, False
+                print(f'setup: {len(bad)} pieces of {self.name} were not right on the disk; fetching them again from the servers', flush=True)
+                for k in bad:
+                    if st.redo(k) > PIECE_TRIES:
+                        raise Failed('checksum', f'Part of {self.name} kept coming out different from its published hash. '
+                                                 'What was downloaded is kept.', kept=True)
+        finally:
+            self.halt.set()
+            if self.swarm.proc is not None:
+                self.swarm.stop()
+            self._save_segments()
+
+    def _fill(self, ctx, on):
+        """Runs the connections (and with `on`, takes rqbit's pieces) until every piece is done. Returns whether rqbit is still on,
+        or None if the server will not send pieces."""
+        st, workers = self.st, []
+        last_save = last_progress = last_harvest = 0
+        try:
+            while True:
+                if not workers and not st.complete():
+                    self.halt.clear()
+                    workers = [threading.Thread(target=self._worker, args=(ctx, src), daemon=True, name=f'setup-dl-{n}-{i}')
+                               for n, src in enumerate(self.sources) if src not in self.banned for i in range(self.connections)]
+                    for w in workers:
+                        w.start()
+                self.control.check()
+                now = time.time()
+                if on and not self.swarm.wanted():
+                    print('setup: BitTorrent was turned off; the download goes on from the servers', flush=True)
+                    self.swarm.stop()
+                    on = False
+                if on and now - last_harvest > HARVEST_EVERY:
+                    self.swarm.poll()
+                    taken = self._harvest()
+                    if taken:
+                        self.peer_bytes += taken
+                        self.on_peers(self.peer_bytes)
+                    last_harvest = now
+                if now - last_save > SAVE_EVERY:
+                    self._save_segments()
+                    last_save = now
+                if now - last_progress > 0.25:
+                    self.progress(st.received(), self.size, 'downloading')
+                    last_progress = now
+                if st.complete():
+                    return on
+                if workers and not any(w.is_alive() for w in workers):
+                    if self.ranges_ignored:
+                        if on:
+                            self.swarm.stop()
+                        return None
+                    if isinstance(self.error, _Restart):
+                        print(f'setup: the file on the server changed; starting {self.name} over', flush=True)
+                        if on:
+                            self.swarm.stop()
+                            on = False
+                        with open(self.part, 'r+b') as f:
+                            f.truncate(0)
+                        st.reset()
+                        self.etag, self.error, workers = None, None, []
+                        continue
+                    if self.error:
+                        raise self.error
+                    if not st.complete():
+                        if on:                    # the servers gave up, but other people may still have it
+                            workers = []
+                            self.halt.wait(BACKOFF[-1])
+                            continue
+                        raise Failed('network', 'The connection kept breaking. Check the internet connection, then try again.')
+                    workers = []
+                with st.cv:
+                    st.cv.wait(0.2)
+        finally:
+            self.halt.set()
+            for w in workers:
+                w.join(5)
+
+    def _harvest(self):
+        """The pieces rqbit has put on the disk, from the first one not done on while they match their torrent piece hashes there
+        (rqbit fetches from the front), at most HARVEST_MAX each time. Returns the bytes taken."""
+        st, taken, checked, misses = self.st, 0, 0, 0
+        k = next((i for i in range(st.count) if not st.is_done(i)), None)
+        while k is not None and k < st.count and checked < HARVEST_MAX and misses < 4:   # 4 in a row: past what rqbit has
+            with st.cv:
+                skip = st.is_done(k) or k in st.claimed
+            if not skip:
+                a, b = st.span(k)
+                if self._hash_range(hashlib.sha256(), a, b)[1]:
+                    misses += 1                 # not there yet, or a bad peer's bytes rqbit will fetch again
+                else:
+                    misses = 0
+                    st.finish(k, 'swarm')
+                    taken += b - a
+            k += 1
+            checked += 1
+        return taken
+
+    def _verify_all(self):
+        """The whole file read back: (its SHA-256, [segments with a torrent piece that does not match])."""
+        h, bad, st = hashlib.sha256(), [], self.st
+        for k in range(st.count):
+            a, b = st.span(k)
+            if self._hash_range(h, a, b)[1]:
+                bad.append(k)
+            self.progress(b, self.size, 'verifying')
+        return h, bad
+
     def _save_segments(self):
         try:
             _save_meta(self.meta, {'url': self.url, 'size': self.size, 'sha256': self.sha256, 'etag': self.etag,
@@ -732,6 +887,8 @@ class Download:
                             wrong = wrong or piece.digest() != P.hashes[k]
                             piece = None
                 a += len(chunk)
+        if P and a < b:                        # the disk ended first: a piece not all there is not right
+            wrong = True
         return own.digest(), wrong
 
     def _worker(self, ctx, src=None):
@@ -745,7 +902,7 @@ class Download:
                 return
             k, progressed, busy = None, False, False
             try:
-                k = st.claim(self.connections * WINDOW)
+                k = st.claim(self.connections * WINDOW, from_back=self.from_back)
                 if k is None:
                     if st.complete() or not st.unclaimed():
                         return
@@ -1108,9 +1265,16 @@ class Segments:
         with self.cv:
             return any(not self.done[k] and k not in self.claimed for k in range(self.count))
 
-    def claim(self, window):
-        """The lowest piece not done and not taken, if it is within `window` pieces of the first one not done."""
+    def claim(self, window, from_back=False):
+        """The lowest piece not done and not taken, if it is within `window` pieces of the first one not done. from_back: the
+        highest instead, anywhere (rqbit fills the same file from the front, and the file is sparse)."""
         with self.cv:
+            if from_back:
+                for k in range(self.count - 1, -1, -1):
+                    if not self.done[k] and k not in self.claimed:
+                        self.claimed.add(k)
+                        return k
+                return None
             first = next((k for k in range(self.count) if not self.done[k]), None)
             if first is None:
                 return None
@@ -1152,6 +1316,25 @@ class Segments:
             self.source.pop(k, None)
             self.cv.notify_all()
             return self.redos[k]
+
+
+def _sparse(path):
+    """Windows: the file is marked sparse, so a write far from the front does not first fill everything before it with zeros
+    (measured on NTFS: 17 s to write at 8 GiB into a plain file, 0.02 s into a sparse one). Elsewhere nothing to do."""
+    if os.name != 'nt':
+        return
+    try:
+        import ctypes
+        import msvcrt
+        from ctypes import wintypes
+        k32 = ctypes.WinDLL('kernel32', use_last_error=True)
+        k32.DeviceIoControl.argtypes = [wintypes.HANDLE, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD,
+                                        ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p]
+        with open(path, 'r+b') as f:
+            n = wintypes.DWORD()
+            k32.DeviceIoControl(wintypes.HANDLE(msvcrt.get_osfhandle(f.fileno())), 0x900C4, None, 0, None, 0, ctypes.byref(n), None)
+    except (OSError, AttributeError, ValueError):
+        pass
 
 
 def _netloc(url):

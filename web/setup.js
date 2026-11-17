@@ -409,16 +409,16 @@
     const sh = S.sharing;
     if (!sh) return '';
     const opt = sh.available ? `<label class="s-opt s-ai"><input type="checkbox" id="shareBox"${sh.on ? ' checked' : ''}>
-      <span class="s-opt-in"><span class="s-opt-h"><b>Share what you download</b><span class="s-badge">Optional</span></span>
-      <small>Keeps the downloaded files after they are unpacked, and shares them with other people over BitTorrent while Lastbook is open. They see this computer’s address. Every piece is checked, so nobody can change your files.</small>
-      <span class="s-sizes"><span>Uses about as much disk again as the download</span></span></span></label>` : '';
+      <span class="s-opt-in"><span class="s-opt-h"><b>Download and share with BitTorrent</b><span class="s-badge">Optional</span></span>
+      <small>Downloads also come from other people who share Lastbook, and what you download is kept and shared with them while Lastbook is open. They see this computer’s address. Every piece is checked, so nobody can change your files.</small>
+      <span class="s-sizes"><span>Keeps the download: about as much disk again</span></span></span></label>` : '';
     return `<h2>Sharing and mirrors</h2>${opt}<div class="s-have">${mirrorRow()}</div>`;
   }
   function sharingRows() {
     const sh = S.sharing;
     if (!sh) return '';
     const n = sh.seeding || 0;
-    const share = sh.available ? `<div class="s-row">${ico('up', 's-ri')}<span><b>Share downloads</b><small>${sh.on ? (n ? `Sharing ${n} ${n === 1 ? 'file' : 'files'} over BitTorrent while Lastbook is open` : 'On. Downloads are kept and shared') : 'Off. When it is on, other people download from this computer over BitTorrent and see its address.'}${sh.kept_bytes ? ' · ' + size(sh.kept_bytes) + ' kept' : ''}${sh.shared_bytes ? ` · <b class="s-shared">${size(sh.shared_bytes)} shared with other people so far</b>` : ''}</small></span>
+    const share = sh.available ? `<div class="s-row">${ico('up', 's-ri')}<span><b>Download and share with BitTorrent</b><small>${sh.on ? (n ? `Sharing ${n} ${n === 1 ? 'file' : 'files'} while Lastbook is open; downloads also come from other people` : 'On. Downloads also come from other people, and are kept and shared') : 'Off. When it is on, downloads also come from other people, and they download from this computer and see its address.'}${sh.kept_bytes ? ' · ' + size(sh.kept_bytes) + ' kept' : ''}${sh.shared_bytes ? ` · <b class="s-shared">${size(sh.shared_bytes)} shared with other people so far</b>` : ''}</small></span>
       ${sh.on ? '<button class="btn plain" id="shareOff">Stop sharing</button>' : `<button class="btn plain" id="shareOn">Share</button>${sh.kept_bytes ? `<button class="btn plain" id="shareDel">${ico('trash')}Delete kept files</button>` : ''}`}</div>` : '';
     return `<div class="s-have">${share}${mirrorRow()}</div>`;
   }
@@ -517,7 +517,7 @@
     if (showPct) bar.setAttribute('aria-valuenow', Math.round(pct)); else bar.removeAttribute('aria-valuenow');
     let t = '';
     if (it.state === 'done') t = it.bytes_total ? size(it.bytes_total) : '';
-    else if (it.state === 'downloading') t = [`${size(it.bytes_done)} of ${size(it.bytes_total)}`, rate(it.rate_bps), eta(it.eta_s)].filter(Boolean).join(' · ');
+    else if (it.state === 'downloading') t = [`${size(it.bytes_done)} of ${size(it.bytes_total)}`, rate(it.rate_bps), eta(it.eta_s), it.from_peers ? `${size(it.from_peers)} from people sharing` : ''].filter(Boolean).join(' · ');
     else if (it.state === 'downloaded' || (it.state === 'paused' && it.paused_from === 'downloaded')) t = behind(it) ? 'Downloaded. It goes in after the one above.' : 'Downloaded.';
     else if (it.state === 'failed' && it.error && it.error.message && S.job && S.job.state !== 'failed') t = it.error.message;
     else if (it.state === 'paused' && noDownload(it)) t = `${STOPPED[it.paused_from] || 'Stopped'}${it.paused_from === 'unpacking' && it.bytes_done && it.bytes_total ? ` at ${size(it.bytes_done)} of ${size(it.bytes_total)}` : ''}. Nothing to download.`;
