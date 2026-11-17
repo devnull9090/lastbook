@@ -19,10 +19,13 @@
   - A file whose BitTorrent v2 pieces root is pinned in the manifest (engine/setup/torrent.py) has each piece checked against the
     torrent's piece hashes as it is read back, so its pieces may also come from mirrors: any https host, chosen by Lastbook's
     manifest or by the person. A mirror that sends one wrong piece is not used again; the file's SHA-256 is still the last word.
+  - Plain HTTP goes to one place only: 127.0.0.1, to the rqbit Lastbook itself started for sharing (engine/setup/share.py), with
+    a password made for that run (local_api). Nothing else is reached that way, and its answers are only read as numbers.
   - Nothing here runs unless the person started or resumed a download (or opened setup: one GET of the manifest).
 
 Tests pass their own `allowed` and `context` to reach a local test server. The product never does.
 """
+import base64
 import errno
 import hashlib
 import http.client
@@ -269,6 +272,36 @@ def fetch_small(url, limit=1 << 20, allowed=None, context=None, timeout=10):
             conn.close()
     except (OSError, http.client.HTTPException, Failed, ValueError):
         return None
+
+
+def loopback_port():
+    """A free TCP port on 127.0.0.1, for the control API of a program Lastbook starts (rqbit). Nothing listens on it here."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        s.bind(('127.0.0.1', 0))
+        return s.getsockname()[1]
+    finally:
+        s.close()
+
+
+def local_api(port, secret, method, path, body=None, limit=1 << 20, timeout=5):
+    """One request to the control API of the rqbit Lastbook started (engine/setup/share.py), on 127.0.0.1 only, with the password
+    made for that run: (status, bytes), or None. No redirect is followed and the answer is capped."""
+    if not isinstance(port, int) or not 0 < port < 65536 or not isinstance(path, str) or not path.startswith('/'):
+        return None
+    conn = http.client.HTTPConnection('127.0.0.1', port, timeout=timeout)
+    try:
+        headers = {'Authorization': 'Basic ' + base64.b64encode(f'lastbook:{secret}'.encode()).decode(), 'User-Agent': USER_AGENT}
+        if body is not None:
+            headers['Content-Type'] = 'application/octet-stream'
+        conn.request(method, path, body=body, headers=headers)
+        r = conn.getresponse()
+        data = r.read(limit + 1)
+        return (r.status, data) if len(data) <= limit else None
+    except (OSError, http.client.HTTPException, ValueError):
+        return None
+    finally:
+        conn.close()
 
 
 def _load_meta(path):

@@ -124,7 +124,7 @@ class Setup:
         self.ai_measure, self.measuring = None, False
         self.deleting = set()
         self.rejected = {}         # path -> (size, mtime) of a file already here that failed its SHA-256: not offered or used again
-        self.seeder = share.Seeder(share_command)
+        self.seeder = share.Seeder(share_command, share.Tally(self.settings_dir / 'setup' / 'shared.json'))
         self.job = self._load_job()
         if self.mode == 'manage' and self.current and self._settings().get('share'):
             threading.Thread(target=self.seed_now, daemon=True, name='setup-share').start()
@@ -439,7 +439,7 @@ class Setup:
         kept = self._kept()
         return {'mirrors': self._mirror_bases(), 'available': self.seeder.available(), 'on': bool(self._settings().get('share')),
                 'seeding': sum(len(t) for _, t in self.seeder.running()), 'kept': [{'name': f['name'], 'size': f['size']} for f, _, _, _ in kept],
-                'kept_bytes': sum(f['size'] for f, _, _, own in kept if own)}
+                'kept_bytes': sum(f['size'] for f, _, _, own in kept if own), 'shared_bytes': self.seeder.shared()}
 
     def set_share(self, on):
         """Turns sharing on or off. On: what is kept is seeded now, and what is downloaded from now on is kept. Off: seeding stops;

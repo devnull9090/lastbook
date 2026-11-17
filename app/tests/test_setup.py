@@ -1029,10 +1029,43 @@ class Mirrored(Base):
         self.assertEqual((kept['torrent']['pieces_root'], kept['mirrors']), (self.zip_pin['pieces_root'], f['mirrors']))
 
 
-FAKE_RQBIT = """import json, sys, time
-open(sys.argv[1], 'a', encoding='utf-8').write(json.dumps(sys.argv[2:]) + '\\n')
+FAKE_RQBIT = r'''
+import base64, json, os, sys, time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+record, args = sys.argv[1], sys.argv[2:]
+open(record, 'a', encoding='utf-8').write(json.dumps(args) + '\n')
+auth = 'Basic ' + base64.b64encode(os.environ.get('RQBIT_HTTP_BASIC_AUTH_USERPASS', '').encode()).decode()
+
+
+class H(BaseHTTPRequestHandler):
+    def log_message(self, *a):
+        pass
+
+    def answer(self, code, obj):
+        body = json.dumps(obj).encode()
+        self.send_response(code)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        if self.headers.get('Authorization') != auth:
+            return self.answer(401, {'error': 'unauthorized'})
+        if self.path == '/stats':
+            try:
+                up = int(open(record + '.uploaded').read())
+            except (OSError, ValueError):
+                up = 0
+            return self.answer(200, {'counters': {'uploaded_bytes': up, 'fetched_bytes': 0}})
+        return self.answer(404, {})
+
+
+if '--http-api-listen-addr' in args:
+    port = int(args[args.index('--http-api-listen-addr') + 1].rsplit(':', 1)[1])
+    ThreadingHTTPServer(('127.0.0.1', port), H).serve_forever()
 time.sleep(120)
-"""
+'''
 
 
 class Sharing(Base):
@@ -1047,7 +1080,7 @@ class Sharing(Base):
         self.files.data['Lastbook-Small.zip.torrent'] = data
         self.record = self.tmp / 'rqbit-calls.txt'
         fake = self.tmp / 'fake_rqbit.py'
-        fake.write_text(FAKE_RQBIT.replace('\\\\n', '\\n'))
+        fake.write_text(FAKE_RQBIT)
         self.command = [sys.executable, '-I', '-B', str(fake), str(self.record)]
 
     def shared_manifest(self):
@@ -1090,14 +1123,19 @@ class Sharing(Base):
         self.assertFalse((self.parent / 'LastbookData.setup').exists())
         m = self.setup('manage', current=lib, manifest=self.shared_manifest(), share_command=self.command)
         args = self.calls()[0]                                                                # the app opened: seeding started
-        self.assertEqual(args[args.index('download'):], ['download', '--overwrite', '--disable-http-api', '-o', str(kept), str(kept / 'Lastbook-Small.zip.torrent')])
+        self.assertEqual(args[args.index('download'):], ['download', '--overwrite', '-o', str(kept), str(kept / 'Lastbook-Small.zip.torrent')])
+        self.assertTrue(args[args.index('--http-api-listen-addr') + 1].startswith('127.0.0.1:'))     # its control API: this computer only
         for flag in ('--disable-dht-persistence', '--disable-upnp-port-forward'):
             self.assertIn(flag, args)
         t0 = time.time()
         while not m.seeder.running() and time.time() - t0 < 10:
             time.sleep(0.05)
+        Path(str(self.record) + '.uploaded').write_text('12345')
+        t0 = time.time()
+        while m.state()['sharing']['shared_bytes'] != 12345 and time.time() - t0 < 10:
+            time.sleep(0.1)
         st = m.state()['sharing']
-        self.assertEqual((st['on'], st['seeding'], st['kept_bytes']), (True, 1, len(self.zip)))
+        self.assertEqual((st['on'], st['seeding'], st['kept_bytes'], st['shared_bytes']), (True, 1, len(self.zip), 12345))
         self.assertEqual(m.set_share(False)['seeding'], 0)                                   # off: rqbit stops, the files stay
         self.assertTrue((kept / 'Lastbook-Small.zip').is_file())
         r = m.delete_kept()
@@ -1128,6 +1166,42 @@ class Sharing(Base):
             s = self.setup(manifest=self.shared_manifest())
             self.assertFalse(s.state()['sharing']['available'])
             self.assertEqual(s.set_share(True)['code'], 'unavailable')
+
+    def test_shared_bytes_add_up_across_runs(self):
+        """rqbit counts what it uploaded from 0 each time it starts: the total adds each run's count, and is kept in its own file."""
+        tally = share.Tally(self.tmp / 'shared.json')
+        seeder = share.Seeder(self.command, tally)
+        counter = Path(str(self.record) + '.uploaded')
+        self.assertEqual(seeder.start({str(self.tmp): [str(self.tmp / 'a.torrent')]}), 1)
+        port, secret = seeder.procs[0][3], seeder.procs[0][4]
+        self.wait_for_api(port, secret)
+        self.assertEqual(download.local_api(port, 'not-the-password', 'GET', '/stats')[0], 401)   # only Lastbook can ask it
+        counter.write_text('100')
+        self.assertEqual(seeder.shared(), 100)
+        counter.write_text('250')
+        self.assertEqual(seeder.shared(), 250)
+        counter.write_text('300')
+        seeder.stop()                                                   # a last reading before the process goes
+        self.assertEqual(tally.total(), 300)
+        counter.write_text('40')                                        # a new run counts from 0 again
+        seeder.start({str(self.tmp): [str(self.tmp / 'a.torrent')]})
+        self.wait_for_api(seeder.procs[0][3], seeder.procs[0][4])
+        self.assertEqual(seeder.shared(), 340)
+        seeder.stop()
+        self.assertEqual(share.Tally(self.tmp / 'shared.json').total(), 340)
+
+    def wait_for_api(self, port, secret):
+        t0 = time.time()
+        while time.time() - t0 < 20:
+            r = download.local_api(port, secret, 'GET', '/stats')
+            if r and r[0] == 200:
+                return
+            time.sleep(0.05)
+        self.fail('the stand-in for rqbit never answered')
+
+    def test_local_api_refuses_what_is_not_a_port_on_this_computer(self):
+        for port, path in ((0, '/stats'), (70000, '/stats'), ('80', '/stats'), (8080, 'stats'), (8080, 'http://example.org/')):
+            self.assertIsNone(download.local_api(port, 'x', 'GET', path))
 
     def test_seeder_stops_its_processes(self):
         seeder = share.Seeder(self.command)

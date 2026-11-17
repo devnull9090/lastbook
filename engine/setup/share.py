@@ -3,9 +3,10 @@
 With sharing on, setup keeps each downloaded file whose torrent is pinned in the manifest (engine/setup/torrent.py) instead of
 deleting it once it is unpacked: in <library>.share beside the library, with its .torrent. While Lastbook is open those files
 are seeded by rqbit, a BitTorrent program bundled with the app (by Igor Katson, Apache-2.0; the build fetches a pinned
-release, packaging/share/). Lastbook itself still opens no port and makes no connection here: it starts rqbit and
-stops it. rqbit is started
-  - with no HTTP API (nothing listens for commands) and no UPnP (the router is not changed), saving no DHT state,
+release, packaging/share/). Lastbook itself opens no port and connects to nothing here: it starts rqbit, stops it, and asks it
+(engine/setup/download.local_api) how much it has uploaded, which is added up across runs (Tally). rqbit is started
+  - with its control API on 127.0.0.1 only, behind a password made for that run, and no UPnP (the router is not changed),
+    saving no DHT state,
   - with only the torrents Lastbook hands it, each checked against its pinned pieces root first,
   - checking each file against its torrent before it uploads a byte (its own check, --overwrite),
   - tied to Lastbook: on Windows a job object ends it with the app, on Linux the parent-death signal, and on a Mac it is ended
@@ -13,13 +14,17 @@ stops it. rqbit is started
 Peers it meets see this computer's address, as with any BitTorrent program; the setting says so.
 """
 import atexit
+import json
 import os
+import secrets
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 
 SUFFIX = '.share'
+TALLY_EVERY = 15                    # seconds between readings of what rqbit has uploaded
 
 
 def binary():
@@ -37,23 +42,79 @@ def folder_for(target):
     return Path(target).with_name(Path(target).name + SUFFIX)
 
 
-def arguments(folder, torrents, upload_bps=None):
-    """rqbit's arguments to seed `torrents` (paths of .torrent files) whose data is in `folder`."""
+def arguments(folder, torrents, upload_bps=None, port=None):
+    """rqbit's arguments to seed `torrents` (paths of .torrent files) whose data is in `folder`, its control API on 127.0.0.1:port."""
     args = ['--disable-dht-persistence', '--disable-upnp-port-forward', '-v', 'warn']
     if upload_bps:
         args += ['--ratelimit-upload', str(int(upload_bps))]
-    return args + ['download', '--overwrite', '--disable-http-api', '-o', str(folder)] + [str(t) for t in torrents]
+    if port:
+        args += ['--http-api-listen-addr', f'127.0.0.1:{int(port)}']
+    return args + ['download', '--overwrite'] + ([] if port else ['--disable-http-api']) + ['-o', str(folder)] + [str(t) for t in torrents]
+
+
+def uploaded(port, secret):
+    """What the rqbit at 127.0.0.1:port has uploaded since it started, from its own count, or None."""
+    from . import download
+    r = download.local_api(port, secret, 'GET', '/stats')
+    if not r or r[0] != 200:
+        return None
+    try:
+        n = json.loads(r[1])['counters']['uploaded_bytes']
+    except (ValueError, KeyError, TypeError):
+        return None
+    return n if isinstance(n, int) and not isinstance(n, bool) and 0 <= n < 1 << 62 else None
+
+
+class Tally:
+    """Bytes uploaded to other people, all time, in its own file (not setup.json, which other actions rewrite). rqbit counts
+    from 0 each time it starts, so each reading adds what came since that process's last reading, and a smaller one starts
+    again from 0."""
+
+    def __init__(self, path):
+        self.path, self.lock, self.last = Path(path), threading.Lock(), {}
+
+    def total(self):
+        try:
+            n = json.loads(self.path.read_text(encoding='utf-8')).get('uploaded_bytes', 0)
+            return n if isinstance(n, int) and n >= 0 else 0
+        except (OSError, ValueError, AttributeError):
+            return 0
+
+    def add(self, readings):
+        """readings: {process: bytes it has uploaded so far}. Returns the total."""
+        with self.lock:
+            total, grew = self.total(), False
+            for key, now in readings.items():
+                if now is None:
+                    continue
+                before = self.last.get(key, 0)
+                step = now - before if now >= before else now
+                self.last[key] = now
+                if step:
+                    total += step
+                    grew = True
+            if grew:
+                try:
+                    self.path.parent.mkdir(parents=True, exist_ok=True)
+                    tmp = self.path.with_suffix('.tmp')
+                    tmp.write_text(json.dumps({'uploaded_bytes': total}), encoding='utf-8')
+                    os.replace(tmp, self.path)
+                except OSError as e:
+                    print(f'setup: could not save what was shared: {e}', flush=True)
+            return total
 
 
 class Seeder:
-    """The rqbit processes seeding the kept files: one for each folder of data. command: the program to run instead of the bundled
-    rqbit (tests)."""
+    """The rqbit processes seeding the kept files: one for each folder of data, each with its control API on 127.0.0.1 behind its
+    own password, read every TALLY_EVERY seconds for what it has uploaded. command: the program to run instead of the bundled
+    rqbit (tests). tally: where the uploaded bytes are added up."""
 
-    def __init__(self, command=None):
-        self.command = command
+    def __init__(self, command=None, tally=None):
+        self.command, self.tally = command, tally
         self.procs = []
         self.lock = threading.Lock()
         self._job = None
+        self._watch = None
         atexit.register(self.stop)
 
     def available(self):
@@ -70,20 +131,26 @@ class Seeder:
             for folder, torrents in groups.items():
                 if not torrents:
                     continue
-                kw = {'stdin': subprocess.DEVNULL, 'stdout': subprocess.DEVNULL, 'stderr': subprocess.DEVNULL, 'close_fds': True}
+                from . import download
+                port, secret = download.loopback_port(), secrets.token_urlsafe(24)
+                kw = {'stdin': subprocess.DEVNULL, 'stdout': subprocess.DEVNULL, 'stderr': subprocess.DEVNULL, 'close_fds': True,
+                      'env': {**os.environ, 'RQBIT_HTTP_BASIC_AUTH_USERPASS': f'lastbook:{secret}'}}
                 if os.name == 'nt':
                     kw['creationflags'] = 0x08000000          # CREATE_NO_WINDOW
                 elif sys.platform.startswith('linux'):
                     kw['preexec_fn'] = _die_with_parent
                 try:
-                    p = subprocess.Popen(prog + arguments(folder, torrents, upload_bps), **kw)
+                    p = subprocess.Popen(prog + arguments(folder, torrents, upload_bps, port), **kw)
                 except OSError as e:
                     print(f'setup: sharing could not start: {e}', flush=True)
                     continue
                 if os.name == 'nt':
                     self._tie(p)
-                self.procs.append((p, str(folder), [str(t) for t in torrents]))
+                self.procs.append((p, str(folder), [str(t) for t in torrents], port, secret))
                 n += len(torrents)
+            if n and self.tally is not None and not (self._watch and self._watch.is_alive()):
+                self._watch = threading.Thread(target=self._count, daemon=True, name='setup-share-count')
+                self._watch.start()
         if n:
             print(f'setup: sharing {n} files with BitTorrent', flush=True)
         return n
@@ -91,15 +158,37 @@ class Seeder:
     def running(self):
         """[(data folder, [torrent paths])] of the processes still running."""
         with self.lock:
-            return [(f, t) for p, f, t in self.procs if p.poll() is None]
+            return [(f, t) for p, f, t, _, _ in self.procs if p.poll() is None]
+
+    def readings(self):
+        """{process: bytes uploaded so far} of the processes running."""
+        with self.lock:
+            procs = list(self.procs)
+        return {(p.pid, port): uploaded(port, secret) for p, _, _, port, secret in procs if p.poll() is None}
+
+    def shared(self):
+        """All the bytes uploaded to other people so far, with what the running processes say now."""
+        if self.tally is None:
+            return 0
+        return self.tally.add(self.readings())
+
+    def _count(self):
+        while True:
+            with self.lock:
+                if not self.procs:
+                    return
+            self.shared()
+            time.sleep(TALLY_EVERY)
 
     def stop(self):
+        if self.tally is not None:
+            self.shared()                  # the last reading, before the count goes with the process
         with self.lock:
             procs, self.procs = self.procs, []
-        for p, _, _ in procs:
+        for p, _, _, _, _ in procs:
             if p.poll() is None:
                 p.terminate()
-        for p, _, _ in procs:
+        for p, _, _, _, _ in procs:
             try:
                 p.wait(5)
             except subprocess.TimeoutExpired:

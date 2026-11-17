@@ -418,7 +418,7 @@
     const sh = S.sharing;
     if (!sh) return '';
     const n = sh.seeding || 0;
-    const share = sh.available ? `<div class="s-row">${ico('up', 's-ri')}<span><b>Share downloads</b><small>${sh.on ? (n ? `Sharing ${n} ${n === 1 ? 'file' : 'files'} over BitTorrent while Lastbook is open` : 'On. Downloads are kept and shared') : 'Off. When it is on, other people download from this computer over BitTorrent and see its address.'}${sh.kept_bytes ? ' · ' + size(sh.kept_bytes) + ' kept' : ''}</small></span>
+    const share = sh.available ? `<div class="s-row">${ico('up', 's-ri')}<span><b>Share downloads</b><small>${sh.on ? (n ? `Sharing ${n} ${n === 1 ? 'file' : 'files'} over BitTorrent while Lastbook is open` : 'On. Downloads are kept and shared') : 'Off. When it is on, other people download from this computer over BitTorrent and see its address.'}${sh.kept_bytes ? ' · ' + size(sh.kept_bytes) + ' kept' : ''}${sh.shared_bytes ? ` · <b class="s-shared">${size(sh.shared_bytes)} shared with other people so far</b>` : ''}</small></span>
       ${sh.on ? '<button class="btn plain" id="shareOff">Stop sharing</button>' : `<button class="btn plain" id="shareOn">Share</button>${sh.kept_bytes ? `<button class="btn plain" id="shareDel">${ico('trash')}Delete kept files</button>` : ''}`}</div>` : '';
     return `<div class="s-have">${share}${mirrorRow()}</div>`;
   }
