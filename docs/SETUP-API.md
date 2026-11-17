@@ -144,6 +144,21 @@ Added 2026-11-17 (downloads that resume and run at once):
   kept and the job fails with `checksum` and `kept: true` (Retry checks it again). A smaller file, or one that is not a zip,
   is deleted and downloaded once more automatically, then fails with `checksum`, as before.
 
+Added 2026-11-17 (mirrors and sharing, docs/DOWNLOAD-SHARING.md):
+- A manifest file entry (a pack's, map's or address index's file, or a model) may pin
+  `torrent: {url, pieces_root, infohash_v2, piece_length}` (made by `packaging/make_torrent.py`) and list `mirrors` (https, at
+  most 16). A mirror is used only when the torrent's info has that SHA-256 and its piece hashes add up to `pieces_root`; then
+  every piece is checked as it is read back, whatever sent it. A fetched manifest never adds or changes a pin on a pinned entry;
+  it may change that file's mirrors when it pins the very same file and torrent. `state.manifest` files carry `shareable`, not the
+  torrent or the mirrors.
+- `POST /api/setup/mirrors {add}` or `{remove}`: the person's own mirrors (a copy of the download site's tree; a file's path is
+  added). Answers `{mirrors}` or `{error, code: "mirror"}`.
+- `POST /api/setup/share {on}`: sharing on or off; answers `state.sharing`, or `{error, code: "unavailable"}` in a build without
+  rqbit. With it on, each downloaded file with a pinned torrent is kept in `<library>.share` with its `.torrent` instead of being
+  deleted after unpacking, and is seeded with rqbit while Lastbook is open. `POST /api/setup/share-delete` deletes the kept files
+  (`{…state.sharing, ok, freed_bytes}`).
+- `state.sharing` = `{mirrors, available, on, seeding, kept: [{name, size}], kept_bytes}`.
+
 ## Switching to the library
 
 `finish` writes `settings.json` and tells the shell to load `lastbook://app/` (Mac) or `https://lastbook.invalid/` (Windows)

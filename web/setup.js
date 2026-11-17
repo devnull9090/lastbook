@@ -75,6 +75,7 @@
   let pollT = 0;
   let confirmCancel = false, confirmRemove = false, confirmOld = false;
   let note = '', noteOk = false;
+  let addingMirror = false;   // the mirror field is open
   let repair = null;      // a repair under way: {fixed} turns true once it had to download something
 
   const packs = () => (S.manifest && S.manifest.packs) || [];
@@ -235,6 +236,7 @@
       <h2 id="packH">Library</h2>
       <div class="s-opts" role="radiogroup" aria-labelledby="packH">${packCards}</div>
       ${ai ? `<h2>Local AI</h2>${ai}` : ''}
+      ${sharingChoice()}
       <section class="s-sum" id="sum" aria-live="polite"></section>
       <div class="s-go">
         <button class="btn big" id="start"></button>
@@ -244,6 +246,11 @@
       <p class="s-note" id="haveNote" hidden></p>`;
     main.querySelectorAll('input[name=pack]').forEach(r => r.onchange = () => { choice.pack = r.value; shortfall = null; mapSection(); summary() });
     const box = $('#aiBox'); if (box && !box.disabled) box.onchange = () => { choice.ai = box.checked; shortfall = null; summary() };
+    const sb = $('#shareBox'); if (sb) sb.onchange = async () => {
+      const r = await call('share', { on: sb.checked }).catch(e => ({ error: e.message }));
+      if (r && !r.error) S.sharing = { ...S.sharing, ...r }; else sb.checked = !sb.checked;
+    };
+    wireMirrors(chooseView);
     main.querySelectorAll('[data-use]').forEach(b => b.onclick = () => useFile((S.found || [])[+b.dataset.use].path, b));
     $('#start').onclick = start;
     if ($('#toManage')) $('#toManage').onclick = () => go('manage');
@@ -365,6 +372,7 @@
           return `<div class="s-row">${ico('map', 's-ri')}<span><b>${mNow ? 'Detailed map: ' + esc(mapName(mNow)) : 'Detailed map'}</b><small>${mNow ? (mNow === 'us' ? 'Local streets and terrain everywhere' : 'Local streets, buildings and terrain') : 'None yet. Add one for your state.'}</small></span>
           <button class="btn plain" id="mapCh">${(c.address_indexes || []).length ? 'Choose state' : 'Add address search'}</button></div>` })() : ''}
       </div>
+      ${sharingRows()}
       ${old ? `<div class="s-row s-old">${ico('folder', 's-ri')}<span><b>The old library is still here</b><small>${esc(home(old.path))}${old.bytes ? ' · ' + size(old.bytes) : ''}</small></span>${confirmOld ? `<span class="s-confirm"><span>Delete it for good?</span><button class="btn danger" id="oldYes">Delete</button><button class="btn plain" id="oldNo">Keep</button></span>` : `<button class="btn plain" id="rmOld">${ico('trash')}Delete it</button>`}</div>` : ''}
       ${computer()}
       ${CAN.repair ? `<div class="s-go left"><button class="btn plain" id="repair">${ico('repair')}Check and repair</button></div>` : ''}
@@ -379,11 +387,64 @@
     if ($('#rmOld')) $('#rmOld').onclick = () => { confirmOld = true; manageView(); $('#oldNo').focus() };
     if ($('#oldNo')) $('#oldNo').onclick = () => { confirmOld = false; manageView(); $('#rmOld').focus() };
     if ($('#oldYes')) $('#oldYes').onclick = () => act('delete-old', 'The old library is being deleted.', { path: old.path });
+    if ($('#shareOn')) $('#shareOn').onclick = () => shareAct('share', { on: true }, 'Sharing is on. Lastbook shares the kept files while it is open.');
+    if ($('#shareOff')) $('#shareOff').onclick = () => shareAct('share', { on: false }, 'Sharing is off. The kept files stay until you delete them.');
+    if ($('#shareDel')) $('#shareDel').onclick = () => shareAct('share-delete', {}, 'The kept download files were deleted. The library is untouched.');
+    wireMirrors(manageView);
     if ($('#repair')) $('#repair').onclick = async () => {
       const r = await call('start', { repair: true, ai: !!c.model }).catch(e => ({ error: e.message }));
       if (!r || r.error) { note = (r && r.error) || 'Repair could not start.'; manageView(); return }
       repair = { fixed: false }; S.job = r; go('job'); poll();
     };
+  }
+  /* ---- sharing (engine/setup/share.py) and mirrors: state.sharing */
+  function mirrorRow() {
+    const ms = (S.sharing && S.sharing.mirrors) || [];
+    return `<div class="s-row">${ico('down', 's-ri')}<span><b>Mirrors</b><small>${ms.length ? 'Pieces of the downloads also come from these. Every piece is checked against its published hash.' : 'None. A mirror is another server holding the same files. Every piece from it is checked against its published hash.'}</small>
+      ${ms.map((m, i) => `<span class="s-mirror"><code>${esc(m)}</code><button class="s-link" data-unmirror="${i}">Remove</button></span>`).join('')}
+      ${addingMirror ? `<span class="s-mirror"><input class="s-select" id="mirrorUrl" type="url" inputmode="url" autocomplete="off" spellcheck="false" aria-label="The mirror’s https address"><button class="btn" id="mirrorSave">Add</button><button class="btn plain" id="mirrorNo">Cancel</button></span>` : ''}</span>
+      ${addingMirror ? '' : '<button class="btn plain" id="mirrorAdd">Add a mirror</button>'}</div>`;
+  }
+  function sharingChoice() {
+    const sh = S.sharing;
+    if (!sh) return '';
+    const opt = sh.available ? `<label class="s-opt s-ai"><input type="checkbox" id="shareBox"${sh.on ? ' checked' : ''}>
+      <span class="s-opt-in"><span class="s-opt-h"><b>Share what you download</b><span class="s-badge">Optional</span></span>
+      <small>Keeps the downloaded files after they are unpacked, and shares them with other people over BitTorrent while Lastbook is open. They see this computer’s address. Every piece is checked, so nobody can change your files.</small>
+      <span class="s-sizes"><span>Uses about as much disk again as the download</span></span></span></label>` : '';
+    return `<h2>Sharing and mirrors</h2>${opt}<div class="s-have">${mirrorRow()}</div>`;
+  }
+  function sharingRows() {
+    const sh = S.sharing;
+    if (!sh) return '';
+    const n = sh.seeding || 0;
+    const share = sh.available ? `<div class="s-row">${ico('up', 's-ri')}<span><b>Share downloads</b><small>${sh.on ? (n ? `Sharing ${n} ${n === 1 ? 'file' : 'files'} over BitTorrent while Lastbook is open` : 'On. Downloads are kept and shared') : 'Off. When it is on, other people download from this computer over BitTorrent and see its address.'}${sh.kept_bytes ? ' · ' + size(sh.kept_bytes) + ' kept' : ''}</small></span>
+      ${sh.on ? '<button class="btn plain" id="shareOff">Stop sharing</button>' : `<button class="btn plain" id="shareOn">Share</button>${sh.kept_bytes ? `<button class="btn plain" id="shareDel">${ico('trash')}Delete kept files</button>` : ''}`}</div>` : '';
+    return `<div class="s-have">${share}${mirrorRow()}</div>`;
+  }
+  function wireMirrors(rerender) {
+    if ($('#mirrorAdd')) $('#mirrorAdd').onclick = () => { addingMirror = true; rerender(); $('#mirrorUrl').focus() };
+    if ($('#mirrorNo')) $('#mirrorNo').onclick = () => { addingMirror = false; rerender(); $('#mirrorAdd').focus() };
+    const save = async body => {
+      const typed = $('#mirrorUrl') ? $('#mirrorUrl').value : '';
+      const r = await call('mirrors', body).catch(e => ({ error: e.message }));
+      if (r && !r.error) { S.sharing = { ...S.sharing, mirrors: r.mirrors }; addingMirror = false; note = '' }
+      else { note = (r && r.error) || 'That mirror could not be added.'; noteOk = false }
+      rerender();
+      if (addingMirror && $('#mirrorUrl')) $('#mirrorUrl').value = typed;   // what was typed stays, to be put right
+      const n = $('#haveNote'); if (note && n) { n.hidden = false; n.textContent = note; n.tabIndex = -1; n.focus() }
+    };
+    if ($('#mirrorSave')) $('#mirrorSave').onclick = () => save({ add: $('#mirrorUrl').value });
+    if ($('#mirrorUrl')) $('#mirrorUrl').onkeydown = e => { if (e.key === 'Enter') save({ add: $('#mirrorUrl').value }) };
+    main.querySelectorAll('[data-unmirror]').forEach(b => b.onclick = () => save({ remove: ((S.sharing && S.sharing.mirrors) || [])[+b.dataset.unmirror] }));
+  }
+  async function shareAct(path, body, done) {
+    const r = await call(path, body).catch(e => ({ error: e.message }));
+    noteOk = !(r && r.error);
+    note = r && r.error ? r.error : done;
+    if (r && !r.error) S.sharing = { ...S.sharing, ...r };
+    manageView();
+    const n = $('#haveNote'); if (n) { n.tabIndex = -1; n.focus() }
   }
   async function act(path, done, body) {
     const r = await call(path, body || {}).catch(e => ({ error: e.status === 404 ? 'This Lastbook cannot do that yet.' : e.message }));

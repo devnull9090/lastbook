@@ -131,6 +131,10 @@ SCENARIOS['parallel-paused'] = dict(hardware=hw('windows', ram=32, free=2000), r
                                         {**_PAR[1], 'state': 'paused', 'paused_from': 'downloaded'},
                                         {**_PAR[2], 'state': 'paused', 'rate_bps': 0, 'eta_s': None},
                                         {**_PAR[3], 'state': 'waiting', 'error': None}]})
+SCENARIOS['sharing'] = dict(mode='manage', hardware=hw('windows', ram=32, free=2000), current={'folder': WIN, 'pack': 'medium', 'model': None, 'map': 'base'},
+                            recommend={'pack': 'medium', 'ai': False, 'why': ''},
+                            sharing={'on': True, 'seeding': 2, 'kept': [{'name': 'Lastbook-Medium.zip', 'size': 66400000000}], 'kept_bytes': 66400000000,
+                                     'mirrors': ['https://mirror.example/lastbook']})
 SCENARIOS['kept'] = dict(hardware=hw('windows', ram=32, free=2000), recommend={'pack': 'all', 'ai': False, 'why': ''},
                          snapshot={'id': 'j1', 'state': 'failed', 'folder': WIN, 'items': [
                              _item('all', 'pack', 'All', 'failed', 387_878_571_619, 387_878_571_619,
@@ -152,6 +156,9 @@ class Stub:
         self.fault = s.get('fault')
         self.found = s.get('found', [])
         self.folder = (self.current or {}).get('folder') or (WIN if s['hardware']['os'] == 'windows' else MAC)
+        self.sharing = {'mirrors': [], 'available': True, 'on': False, 'seeding': 0, 'kept': [], 'kept_bytes': 0}
+        if s.get('sharing'):
+            self.sharing.update(s['sharing'])
         if 'snapshot' in s:
             self.job = {**copy.deepcopy(s['snapshot']), 'frozen': True, 'started': time.time()}
         if 'job' in s:
@@ -167,7 +174,7 @@ class Stub:
         self.tick()
         return {'mode': self.s.get('mode', 'first-run'), 'hardware': self.s['hardware'], 'manifest': self.M,
                 'current': self.current, 'found': self.found, 'recommend': {**self.s['recommend'], 'folder': self.folder.rsplit('\\' if '\\' in self.folder else '/', 1)[0]},
-                'job': self.public()}
+                'job': self.public(), 'sharing': self.sharing}
 
     def _make(self, pack, ai, use=None, map_=None):
         items = []
@@ -411,6 +418,24 @@ class H(BaseHTTPRequestHandler):
             if STUB.s['hardware']['os'] == 'macos':
                 STUB.s['hardware']['disks'].append({'path': '/Volumes/Big Disk', 'name': 'Big Disk', 'free_bytes': 1800 * GB, 'total_bytes': 2000 * GB})
             return self.send(200, {'path': other, 'free_bytes': 1800 * GB, 'disk': 'Data (D:)' if STUB.s['hardware']['os'] == 'windows' else 'Big Disk'})
+        if a == 'share':          # as engine/setup/api.py: on keeps and seeds what is kept
+            on = body.get('on') is True
+            STUB.sharing.update(on=on, seeding=len(STUB.sharing['kept']) if on else 0)
+            return self.send(200, STUB.sharing)
+        if a == 'share-delete':
+            freed = STUB.sharing['kept_bytes']
+            STUB.sharing.update(kept=[], kept_bytes=0, seeding=0)
+            return self.send(200, {**STUB.sharing, 'ok': True, 'freed_bytes': freed})
+        if a == 'mirrors':
+            add, ms = body.get('add'), STUB.sharing['mirrors']
+            if add is not None:
+                if not str(add).startswith('https:') or '@' in str(add):
+                    return self.send(400, {'error': 'That is not an https address Lastbook can use as a mirror.', 'code': 'mirror'})
+                if add not in ms:
+                    ms.append(add)
+            if body.get('remove') is not None:
+                STUB.sharing['mirrors'] = [m for m in ms if m != body['remove']]
+            return self.send(200, {'mirrors': STUB.sharing['mirrors']})
         if a == 'remove-ai':
             if STUB.current:
                 STUB.current['model'] = None

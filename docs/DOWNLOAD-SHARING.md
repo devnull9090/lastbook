@@ -1,69 +1,82 @@
-# Sharing downloads: mirrors and peers (proposal)
+# Sharing downloads: mirrors and BitTorrent
 
-Status: **proposal, not built.** It needs the owner's decision, because parts of it change rules in
-[SETUP-API.md](SETUP-API.md) ("Owner decisions this follows"). Nothing here is in the app.
+The All library is one 388 GB zip, and `downloads.lastbook.org` gives about 1.2 MB/s per connection, so a download takes days.
+Many people want exactly the same bytes. This lets them get those bytes from mirrors and from each other, without anyone along
+the way being able to change one.
 
-## Why
+**Owner decisions this needs.** Two parts change rules in [SETUP-API.md](SETUP-API.md) and `CONTRIBUTING.md`, and are off or
+empty until the owner chooses:
+- **Mirrors** are hosts that are not Lastbook's. A mirror is used only for a file whose torrent is pinned, every piece from it is
+  checked, and the package scan accepts a mirror address in the bundled manifest only beside such a pin. The bundled manifest
+  lists none until the owner adds some, and people can add their own in setup.
+- **Sharing** runs rqbit, a BitTorrent program, which listens for peers. Lastbook itself still opens no port: it starts and stops
+  rqbit. It is off unless the person turns it on, and the setting says that peers see this computer's address.
 
-The All library is one 388 GB zip. `downloads.lastbook.org` gives about 1.2 MB/s per connection and answers 503 once a few
-connections are open (measured 2026-11-17), so even with several connections at once (engine/setup/download.py, `Segments`)
-a download takes days. Many people want exactly the same bytes. Letting them get those bytes from each other, or from
-mirrors run by other people, would make it much faster, but only if nobody along the way can change a byte.
+## The trust chain
 
-## What makes it safe: piece hashes published with each file
+1. The app's bundled manifest pins each file's SHA-256, as before. For a file with a torrent it also pins
+   `torrent: {url, pieces_root, infohash_v2, piece_length}`, written by `packaging/make_torrent.py`.
+2. The torrent is a hybrid BitTorrent v1 and v2 torrent of that one file, with the file's own address as its web seed. Setup
+   fetches it from Lastbook's site only, and uses it only if the SHA-256 of its info is `infohash_v2` and its piece hashes add up
+   to `pieces_root` (`engine/setup/torrent.py`). The info holds the v1 SHA-1 piece hashes too, so v1-only clients such as rqbit
+   and aria2c check the same pinned file.
+3. Each piece is then checked when it is read back from the disk (BEP 52: SHA-256 of 16 KiB blocks, built up to the piece's
+   hash), whatever sent it. A mirror that sends one wrong piece is not asked again. A piece that never matches stops the download
+   after a few tries, with the file kept.
+4. The whole file's SHA-256 is still the last check, and a zip that fails it is repaired from the file's own address only.
 
-Today each file has one SHA-256, in the manifest bundled with the app. It can only say, after the last byte, that something
-somewhere in 388 GB is wrong. A source we do not control could waste days that way.
+So a mirror or a peer can at most waste some bandwidth. It cannot get a changed byte into a library.
 
-The proposal is to publish a **piece list** with each file:
+A fetched manifest can never add or change a pin on a file the app was built with (`manifest.merge`). It may change that
+file's `mirrors`, but only when it pins the very same file and torrent.
 
-- `<file>.pieces`: the SHA-256 of each 32 MiB piece, one after another (32 bytes each). For the 388 GB pack that is about
-  370 KB. The pieces are the same `SEGMENT` the downloader already uses.
-- In the manifest, each file entry gets
-  `"pieces": {"url": "https://downloads.lastbook.org/Lastbook-All.zip.pieces", "size": 369920, "sha256": "…", "piece": 33554432}`.
-  The manifest bundled with the app pins the piece list's own SHA-256, so the list cannot be swapped either. A fetched
-  manifest may add a piece list only to a file the bundled manifest does not pin (the rule `manifest.merge` already applies).
-- `packaging/release_manifest.py` makes the list when it publishes a file (one read of each zip).
-- The downloader fetches the list first, checks its SHA-256, then checks each piece as it arrives, before counting it as
-  done. It already takes the SHA-256 of every piece as it arrives (to compare with what reaches the disk), so this is one more
-  comparison. A piece that does not match is thrown away, fetched again from `downloads.lastbook.org`, and the source that
-  sent it is not used again in this download. The whole file's SHA-256 stays the final check.
+## Mirrors
 
-With that in place, a source can at worst waste one piece of bandwidth. It cannot get a changed byte into a library. The piece
-list also makes the repair after a failed check exact (today a zip is repaired from the CRC-32s in its central directory,
-and a file that is not a zip cannot be repaired at all).
+- A file entry may list `"mirrors": ["https://…/Lastbook-All.zip", …]`: https, no user name or password, port 443, at most 16.
+  They are used only when the torrent pin checks out.
+- A person can add their own (Library and local AI → Mirrors, or `POST /api/setup/mirrors {add}`): the address of a copy of
+  the download site's tree. The file's path on the site is added to it.
+- The downloader gives each mirror its own few connections (`download.Hosts`, per host and port), as it does the file's own
+  address, so each mirror adds capacity.
+- TLS is checked against `roots.pem` as for every download: Let's Encrypt, Google Trust Services, Amazon and GlobalSign, which
+  cover most hosts. A mirror whose certificate chains elsewhere fails and is dropped. Widening that is an owner decision.
 
-## Step 1: mirrors (small change, same rules)
+## Sharing (seeding)
 
-- Each file entry may list `"mirrors": ["https://…"]`, used only when the file has a piece list.
-- A mirror's host must be on `ALLOWED_HOSTS` and `LIBRARY_HOSTS` like any other. The owner chooses who may run one. The
-  rule that the app talks only to known hosts stays, and so does `roots.pem`.
-- `download.Hosts` already gives each server its own few connections and backs off one that answers 503, so each mirror adds
-  its own capacity: with three mirrors a download can have three times the connections.
+- Off by default. When the person turns it on (the choose screen, or Library and local AI → Share downloads):
+  - each downloaded file with a pinned torrent is kept with its `.torrent` in `<library>.share` beside the library, instead of
+    being deleted once it is unpacked. The model is shared from the library itself.
+  - while Lastbook is open, `engine/setup/share.py` seeds them with rqbit:
+    `rqbit --disable-dht-persistence --disable-upnp-port-forward download --overwrite --disable-http-api -o <folder> <torrents>`.
+    That means no HTTP API (nothing listens for commands), no UPnP (the router is not changed) and no saved DHT state. Only
+    torrents whose info matches the pin are seeded, and rqbit checks each file against its torrent before it uploads a byte.
+- rqbit ends with Lastbook: through a Windows job object however Lastbook ends, through the parent-death signal on Linux, and at
+  exit on a Mac.
+- Turning it off stops rqbit and keeps the files. **Delete kept files** removes them. The library is never touched.
+- People with a torrent client (qBittorrent, Transmission, aria2c) can download or seed the same torrent. Setup's existing
+  "Use the file you already have" checks a file got that way before using it.
 
-## Step 2: torrents, outside the app (no app change)
+## For the maintainers
 
-- Publish a BitTorrent v2 `.torrent` (SHA-256 piece hashes) for each zip, with the R2 address as a web seed (BEP 19), so a
-  swarm always has a seed.
-- People who want to can use qBittorrent, Transmission or `aria2c` (which also does several connections at once) and share as
-  they download. Then setup's existing *Use the file you already have* checks the zip against its SHA-256 before using it.
-- Nothing in the app listens, uploads or talks to peers, so none of the owner's rules change.
+```bash
+python3 -I -B packaging/make_torrent.py derived/release/<release>/Lastbook-All.zip --url https://downloads.lastbook.org/Lastbook-All.zip --manifest derived/release/manifest-v1.json
+```
 
-## Step 3: sharing from inside Lastbook (needs the owner's decision)
+This writes `Lastbook-All.zip.torrent` (upload it beside the zip) and pins it in the packs file, which
+`packaging/release_manifest.py` then bundles. The default piece length is 32 MiB, the downloader's segment, which makes about
+370 KB of piece hashes for 388 GB.
 
-What it would take:
+```bash
+python3 -I -B packaging/share/fetch_rqbit.py win-x64
+```
 
-- **A listening socket and uploads.** This reverses "nothing is sent anywhere" and "the one way out" (setup's downloader is the
-  only network code, and it only downloads). `test_only_module_with_connections` and the package scans would change with it.
-- **Opt-in, off by default,** with a plain switch and a limit on upload speed. Only pieces that have passed their check are
-  ever served.
-- **Discovery.** The simplest first version is the local network only (one computer in a household, school or shelter
-  downloads, and the others on the same network fetch from it). Internet-wide sharing needs a tracker or DHT and NAT
-  traversal, which is BitTorrent; implementing it again is a lot of attack surface for a small team. Embedding an existing
-  library (libtorrent) adds a large native dependency to every platform's package.
-- **Privacy.** Peers see each other's IP addresses. A list of who downloaded a survival library is sensitive, so internet-wide
-  sharing should stay something people choose outside the app (Step 2).
+This fetches rqbit 9.1.0 into `derived/share/`, checked against GitHub's own digests pinned in `packaging/share/rqbit.json`. The
+Windows build bundles it to `_internal/share` when it is there, and the package scan accepts only that exact file. The Mac and
+Linux builds do not bundle it yet, so they do not offer sharing.
 
-**Recommendation:** piece lists first (they are needed by everything else, and they improve repair on their own), then mirrors
-(Step 1) and torrents (Step 2). Leave in-app sharing (Step 3) for an owner decision, starting with the local network only if it is
-wanted.
+## Not done yet
+
+- Downloading from the BitTorrent swarm inside Lastbook. rqbit can stream a torrent's file with Range requests, so it could
+  become one more source for the downloader. Doing that without keeping a second copy of the file needs more work.
+- rqbit for the Mac and Linux packages.
+- The iPad app's own downloader.

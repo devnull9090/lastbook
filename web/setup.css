@@ -128,6 +128,9 @@ html.plat-mac.in-app .s-top{padding-top:30px}   /* below the traffic lights of a
 .s-row>span:not(.s-badge):not(.s-confirm){flex:1 1 220px;min-width:0}
 .s-row b{display:block;font:650 18.5px/1.25 var(--display)}
 .s-row small{display:block;font-size:15px;color:var(--ink2);overflow-wrap:anywhere}
+.s-mirror{display:flex;flex-wrap:wrap;align-items:center;gap:8px 12px;margin-top:8px}
+.s-mirror code{font-size:15px;overflow-wrap:anywhere}
+.s-mirror .s-select{flex:1 1 240px;min-height:44px}
 .s-old{margin-top:12px;border-radius:var(--r);background:var(--warn-bg);border:1px solid var(--warn-line)}
 .s-old .s-ri{color:var(--warn)}
 
