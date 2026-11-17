@@ -614,10 +614,11 @@ class Download:
                     if wrong:                      # on the disk as it arrived, but not what the torrent pins: its source sent wrong bytes
                         src = st.source.get(cursor)
                         print(f'setup: piece {cursor} of {self.name} does not match its torrent piece hash; fetching it again', flush=True)
-                        if src and src != self.url and src not in self.banned:
+                        mirror = bool(src) and src != self.url
+                        if mirror and src not in self.banned:
                             self.banned.add(src)
                             print(f'setup: not using the mirror {_netloc(src)} for {self.name} again: it sent a wrong piece', flush=True)
-                        if st.redo(cursor) > PIECE_TRIES:
+                        if st.redo(cursor, count=not mirror) > PIECE_TRIES:      # a mirror's wrong piece is the mirror's fault, not the file's
                             raise Failed('checksum', f'Part of {self.name} kept coming out different from its published hash. '
                                                      'What was downloaded is kept.', kept=True)
                         if not any(w.is_alive() for w in workers):
@@ -1106,14 +1107,15 @@ class Segments:
             self.claimed.discard(k)
             self.cv.notify_all()
 
-    def redo(self, k):
-        """A piece the disk did not keep as it arrived: fetched again from its start. Returns how often that has happened to it."""
+    def redo(self, k, count=True):
+        """A piece to fetch again from its start (the disk did not keep it, or it was wrong). Returns how often that has happened to
+        it, counting only the times that were not a mirror's fault."""
         with self.cv:
             self.done[k] = 0
             self.got.pop(k, None)
             self.hashers.pop(k, None)
             self.digests.pop(k, None)
-            self.redos[k] = self.redos.get(k, 0) + 1
+            self.redos[k] = self.redos.get(k, 0) + (1 if count else 0)
             self.source.pop(k, None)
             self.cv.notify_all()
             return self.redos[k]

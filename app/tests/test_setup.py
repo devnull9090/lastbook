@@ -903,6 +903,41 @@ class Mirrored(Base):
         self.assertEqual(d.banned, {self.mirror})
         self.assertLessEqual(len(_requested(self.mirror_files.log, 'model.gguf')), 2 * 2 * download.WINDOW)
 
+    def test_a_mirror_outside_the_allowlist_is_asked_only_as_a_mirror(self):
+        """This test's allowlist holds 127.0.0.1 only, so the mirror at localhost is outside it: only the mirror rule lets the
+        downloader ask it for pieces, and it is not reachable any other way."""
+        mirror = f'https://localhost:{self.mirror_srv.server_address[1]}/model.gguf'
+        self.assertFalse(download.url_allowed(mirror, ALLOWED))
+        self.mirror_files.data['model.gguf'] = self.model
+        self.files.pace = 0.03                                        # a slow file's own address: the mirror takes pieces too
+        self.assertEqual(Path(self.dl([mirror]).run()).read_bytes(), self.model)
+        self.assertTrue(_requested(self.mirror_files.log, 'model.gguf'))
+        self.mirror_files.log.clear()
+        self.assertIsNone(download.fetch_small(mirror, allowed=ALLOWED, context=self.ctx))
+        with self.assertRaises(download.Failed):                      # as a file's own address: refused before connecting
+            download.Download(mirror, self.tmp / 'own', len(self.model), sha(self.model), download.Control(), allowed=ALLOWED, context=self.ctx).run()
+        self.files.pace = 0
+        self.assertEqual(Path(self.dl([mirror], pieces=False).run()).read_bytes(), self.model)   # no pinned pieces: not asked
+        self.assertEqual(self.mirror_files.log, [])
+
+    def test_bad_mirrors_cannot_fail_a_good_download(self):
+        """A wrong piece from a mirror drops that mirror and is fetched again, but does not count toward giving up on the piece:
+        five bad mirrors are more than PIECE_TRIES, and the download still comes out right."""
+        bad = bytearray(self.model)
+        for k in range(0, len(bad), self.PIECE):
+            bad[k + 5] ^= 0xff
+        mirrors = []
+        for i in range(5):
+            self.mirror_files.data[f'bad{i}/model.gguf'] = bytes(bad)
+            mirrors.append(f'{self.mirror_base}/bad{i}/model.gguf')
+        self.files.pace = 0.03
+        d = self.dl(mirrors)
+        self.assertEqual(Path(d.run()).read_bytes(), self.model)
+        self.assertTrue(d.banned and d.banned <= set(mirrors))         # those that got a turn were dropped (they share a host)
+        st = download.Segments(10 * self.PIECE, self.PIECE)              # and their wrong pieces never count toward giving up
+        self.assertEqual([st.redo(3, count=False) for _ in range(10)][-1], 0)
+        self.assertEqual(st.redo(3), 1)
+
     def test_no_pinned_pieces_no_mirrors(self):
         self.mirror_files.data['model.gguf'] = self.model
         self.assertEqual(Path(self.dl([self.mirror], pieces=False).run()).read_bytes(), self.model)
